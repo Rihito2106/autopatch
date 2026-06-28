@@ -3,16 +3,24 @@ import json
 
 from autopatch.agent import (
     ClassificationOutput,
+    FixProposal,
     ParsedIssue,
+    ReproductionResult,
+    RootCauseOutput,
     WebhookInput,
     detect_injection,
     extract_linked_files,
     extract_stack_trace,
+    fetch_files_for_fix,
+    get_modified_files,
     parse_issue,
+    prepare_root_cause_input,
     redact_emails,
+    reproduce_bug,
     route_issue,
     scrub_secrets,
     security_screen,
+    validate_diff,
 )
 
 
@@ -108,6 +116,26 @@ def test_parse_issue_base64():
     assert parsed.author == "dev"
 
 
+# Test parse_issue node with flat keys format
+def test_parse_issue_flat():
+    payload = {
+        "title": "Flat Bug",
+        "body": "This is a flat body",
+        "author": "flat-dev",
+        "issue_number": 999,
+        "repo_full_name": "flat-owner/flat-repo",
+        "labels": ["flat-bug"],
+    }
+    input_data = WebhookInput(payload=payload)
+    parsed = parse_issue(input_data)
+    assert parsed.title == "Flat Bug"
+    assert parsed.body == "This is a flat body"
+    assert parsed.author == "flat-dev"
+    assert parsed.issue_number == 999
+    assert parsed.repo_full_name == "flat-owner/flat-repo"
+    assert "flat-bug" in parsed.labels
+
+
 # Test security screen node logic
 def test_security_screen_no_injection(monkeypatch):
     parsed = ParsedIssue(
@@ -185,3 +213,256 @@ def test_route_issue():
     classification = ClassificationOutput(classification="docs", severity="normal")
     event = route_issue(classification)
     assert event.actions.route == "non_bug"
+
+
+# --- New Pipeline Node Tests ---
+
+
+def test_get_modified_files():
+    diff_str = """--- a/autopatch/agent.py
++++ b/autopatch/agent.py
+@@ -10,3 +10,3 @@
+-old
++new
+--- a/tests/test_agent.py
++++ b/tests/test_agent.py	2026-06-25 12:00:00.000000000 +0000
+"""
+    files = get_modified_files(diff_str)
+    assert files == ["autopatch/agent.py", "tests/test_agent.py"]
+
+
+def test_prepare_root_cause_input():
+    class MockContext:
+        def __init__(self):
+            self.state = {
+                "repo_full_name": "owner/repo",
+                "issue_number": 42,
+                "title": "A bug",
+                "sanitized_body": "Sanitized body",
+            }
+
+    ctx = MockContext()
+    repro = ReproductionResult(
+        reproduced=True,
+        failing_tests=["test_foo"],
+        traceback="Some traceback",
+        reproduction_command="pytest",
+    )
+    prompt = prepare_root_cause_input(ctx, repro)
+    assert "owner/repo" in prompt
+    assert "Owner: 'owner'" in prompt
+    assert "Repo: 'repo'" in prompt
+    assert "test_foo" in prompt
+
+
+def test_reproduce_bug(monkeypatch):
+    class MockExecResult:
+        def __init__(self, exit_code, output):
+            self.exit_code = exit_code
+            self.output = output
+
+    class MockContainer:
+        def __init__(self):
+            self.id = "mock-container-id"
+            self.attrs = {"NetworkSettings": {"Networks": {"bridge": {}}}}
+            self.commands = []
+
+        def reload(self):
+            pass
+
+        def exec_run(self, cmd, workdir=None):
+            self.commands.append(cmd)
+            if "git clone" in cmd:
+                return MockExecResult(0, b"Cloned successfully")
+            elif "pip install" in cmd:
+                return MockExecResult(0, b"Installed successfully")
+            elif "pytest" in cmd:
+                return MockExecResult(
+                    1, b"FAILED test_agent.py::test_run\nFAILED test_foo.py::test_bar"
+                )
+            return MockExecResult(0, b"Success")
+
+        def stop(self):
+            pass
+
+        def remove(self):
+            pass
+
+    class MockContainers:
+        def __init__(self):
+            self.run_calls = []
+
+        def run(self, image, command, detach=False):
+            self.run_calls.append((image, command))
+            return MockContainer()
+
+    class MockNetwork:
+        def disconnect(self, container):
+            pass
+
+    class MockNetworks:
+        def get(self, name):
+            return MockNetwork()
+
+    class MockImages:
+        def pull(self, image):
+            pass
+
+    class MockDockerClient:
+        def __init__(self):
+            self.containers = MockContainers()
+            self.networks = MockNetworks()
+            self.images = MockImages()
+
+    monkeypatch.setattr("docker.from_env", lambda: MockDockerClient())
+
+    class MockContext:
+        def __init__(self):
+            self.state = {"repo_full_name": "owner/repo"}
+
+    ctx = MockContext()
+    event = reproduce_bug(ctx, None)
+
+    assert event.output.reproduced is True
+    assert "test_agent.py::test_run" in event.output.failing_tests
+    assert "test_foo.py::test_bar" in event.output.failing_tests
+    assert "FAILED test_agent.py::test_run" in event.output.traceback
+    assert event.actions.state_delta["reproduced"] is True
+
+
+def test_fetch_files_for_fix(monkeypatch):
+    class MockResponse:
+        def __init__(self, text, status_code):
+            self.text = text
+            self.status_code = status_code
+
+    def mock_get(url, headers=None):
+        if "agent.py" in url:
+            return MockResponse("print('hello')", 200)
+        return MockResponse("Not Found", 404)
+
+    monkeypatch.setattr("requests.get", mock_get)
+
+    class MockContext:
+        def __init__(self):
+            self.state = {"repo_full_name": "owner/repo"}
+
+    ctx = MockContext()
+    node_input = RootCauseOutput(
+        explanation="Explain here",
+        files_to_modify=["autopatch/agent.py", "nonexistent.py"],
+    )
+
+    event = fetch_files_for_fix(ctx, node_input)
+    assert "autopatch/agent.py" in event.actions.state_delta["file_contents"]
+    assert (
+        "print('hello')"
+        in event.actions.state_delta["file_contents"]["autopatch/agent.py"]
+    )
+    assert (
+        "Error fetching file"
+        in event.actions.state_delta["file_contents"]["nonexistent.py"]
+    )
+
+
+def test_validate_diff():
+    class MockContext:
+        def __init__(self, retries=0):
+            self.state = {
+                "files_to_modify": ["autopatch/agent.py"],
+                "validation_retries": retries,
+            }
+
+    # 1. Success case
+    ctx = MockContext()
+    fix = FixProposal(
+        explanation="Good fix",
+        diff="--- a/autopatch/agent.py\n+++ b/autopatch/agent.py\n+new_code",
+    )
+    event = validate_diff(ctx, fix)
+    assert event.actions.route == "success"
+    assert event.actions.state_delta["validation_status"] == "success"
+
+    # 2. Retry case (retries < 3)
+    ctx = MockContext(retries=1)
+    fix_bad = FixProposal(
+        explanation="Bad fix modifying wrong file",
+        diff="--- a/tests/test_agent.py\n+++ b/tests/test_agent.py\n+new_code",
+    )
+    event = validate_diff(ctx, fix_bad)
+    assert event.actions.route == "retry"
+    assert event.actions.state_delta["validation_retries"] == 2
+
+    # 3. Fail case (retries reaches 3)
+    ctx = MockContext(retries=3)
+    event = validate_diff(ctx, fix_bad)
+    assert event.actions.route == "fail"
+    assert event.actions.state_delta["validation_status"] == "fail"
+    assert event.output is not None
+    assert "Validation failed after 3 retries" in str(event.output)
+
+
+def test_reproduce_bug_install_failure(monkeypatch):
+    class MockExecResult:
+        def __init__(self, exit_code, output):
+            self.exit_code = exit_code
+            self.output = output
+
+    class MockContainer:
+        def __init__(self):
+            self.id = "mock-container-id"
+            self.attrs = {"NetworkSettings": {"Networks": {"bridge": {}}}}
+            self.commands = []
+
+        def reload(self):
+            pass
+
+        def exec_run(self, cmd, workdir=None):
+            self.commands.append(cmd)
+            if "git clone" in cmd:
+                return MockExecResult(0, b"Cloned successfully")
+            elif "pip install" in cmd:
+                return MockExecResult(1, b"Pip installation failed spectacularly!")
+            return MockExecResult(0, b"Success")
+
+        def stop(self):
+            pass
+
+        def remove(self):
+            pass
+
+    class MockContainers:
+        def run(self, image, command, detach=False):
+            return MockContainer()
+
+    class MockNetwork:
+        def disconnect(self, container):
+            pass
+
+    class MockNetworks:
+        def get(self, name):
+            return MockNetwork()
+
+    class MockImages:
+        def pull(self, image):
+            pass
+
+    class MockDockerClient:
+        def __init__(self):
+            self.containers = MockContainers()
+            self.networks = MockNetworks()
+            self.images = MockImages()
+
+    monkeypatch.setattr("docker.from_env", lambda: MockDockerClient())
+
+    class MockContext:
+        def __init__(self):
+            self.state = {"repo_full_name": "owner/repo"}
+
+    ctx = MockContext()
+    event = reproduce_bug(ctx, None)
+
+    assert event.output.reproduced is False
+    assert "Dependency installation failed with code 1" in event.output.traceback
+    assert "Pip installation failed spectacularly!" in event.output.traceback
+

@@ -14,12 +14,21 @@
 # limitations under the License.
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import re
 import json
 import base64
 from typing import List, Optional, Any, Literal
 import google.auth
 from pydantic import BaseModel, Field, model_validator
+
+import docker
+import requests
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
 
 from google.adk.workflow import Workflow, node, START
 from google.adk.agents import LlmAgent
@@ -101,6 +110,45 @@ class ClassificationOutput(BaseModel):
     severity: Literal["critical", "normal", "low"]
 
 
+class ReproductionResult(BaseModel):
+    """Output of reproduction run in Docker container."""
+
+    reproduced: bool = Field(description="Whether the bug was successfully reproduced")
+    failing_tests: List[str] = Field(
+        default_factory=list, description="List of failing test names/IDs"
+    )
+    traceback: str = Field(description="The traceback or test execution output")
+    reproduction_command: str = Field(
+        description="The command used to reproduce the bug"
+    )
+
+
+class RootCauseOutput(BaseModel):
+    """Output of root cause analysis LlmAgent."""
+
+    explanation: str = Field(description="Explanation of the root cause of the bug")
+    files_to_modify: List[str] = Field(
+        description="List of files that need to be modified relative to the repo root"
+    )
+
+
+class FixProposal(BaseModel):
+    """Output of propose fix LlmAgent."""
+
+    explanation: str = Field(description="Explanation of the proposed fix")
+    diff: str = Field(description="Unified diff containing the proposed changes")
+
+
+class NonBugOutput(BaseModel):
+    """Output of handle non bug LlmAgent."""
+
+    explanation: str = Field(
+        description="Explanation of how the non-bug issue was handled"
+    )
+    label_added: str = Field(description="The label that was added to the issue")
+    comment_body: str = Field(description="The body of the comment added to the issue")
+
+
 # --- Helper Functions ---
 
 
@@ -174,6 +222,38 @@ def redact_emails(text: str) -> str:
     return re.sub(email_pattern, "[REDACTED_EMAIL]", text)
 
 
+def get_modified_files(diff_str: str) -> List[str]:
+    modified_files = []
+    if not diff_str:
+        return modified_files
+    for line in diff_str.splitlines():
+        if line.startswith("+++ "):
+            filename = line[4:].strip()
+            if filename.startswith("b/"):
+                filename = filename[2:]
+            filename = filename.split("\t")[0].strip()
+            modified_files.append(filename)
+    return modified_files
+
+
+def fetch_github_file(owner: str, repo: str, path: str, token: str) -> str:
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {}
+    if token:
+        if token.startswith("github_pat") or token.startswith("ghp_"):
+            headers["Authorization"] = f"token {token}"
+        else:
+            headers["Authorization"] = f"Bearer {token}"
+    headers["Accept"] = "application/vnd.github.v3.raw"
+    resp = requests.get(url, headers=headers)
+    if resp.status_code == 200:
+        return resp.text
+    else:
+        raise RuntimeError(
+            f"Failed to fetch {path} from GitHub: {resp.status_code} {resp.text}"
+        )
+
+
 # --- Workflow Nodes (Decoupled from Node wrapper for direct testing) ---
 
 
@@ -199,9 +279,8 @@ def parse_issue(node_input: WebhookInput) -> ParsedIssue:
         # Fallback for other data types
         payload_dict = {"body": str(raw_payload), "title": "Chat Message"}
 
-    # Access issue and repository info with fallback for flat schemas in tests
+    # Access issue info with fallback for flat schemas in tests
     issue = payload_dict.get("issue", payload_dict)
-    repo = payload_dict.get("repository", payload_dict)
 
     title = normalize_newlines(issue.get("title", ""))
     body = normalize_newlines(issue.get("body", ""))
@@ -210,8 +289,22 @@ def parse_issue(node_input: WebhookInput) -> ParsedIssue:
         if isinstance(issue.get("user"), dict)
         else issue.get("author", "")
     )
-    issue_number = issue.get("number")
-    repo_full_name = repo.get("full_name", "")
+
+    # repo_full_name: try flat key first, fall back to nested
+    repo_full_name = payload_dict.get("repo_full_name")
+    if not repo_full_name:
+        repo = payload_dict.get("repository")
+        if isinstance(repo, dict):
+            repo_full_name = repo.get("full_name", "")
+        else:
+            repo_full_name = ""
+
+    # issue_number: try flat key first, fall back to nested
+    issue_number = payload_dict.get("issue_number")
+    if issue_number is None:
+        issue_nested = payload_dict.get("issue")
+        if isinstance(issue_nested, dict):
+            issue_number = issue_nested.get("number")
 
     labels_raw = issue.get("labels", [])
     labels = []
@@ -328,13 +421,423 @@ async def human_approval(ctx: Context, node_input: Any) -> Event:
     )
 
 
-def bug_pipeline(ctx: Context, node_input: Any) -> str:
-    return f"Issue processed via bug pipeline. Title: {ctx.state.get('title')}"
+# --- GitHub MCP Toolset Configuration ---
 
 
-def non_bug(ctx: Context, node_input: Any) -> str:
-    category = getattr(node_input, "classification", "unknown")
-    return f"Issue processed as non-bug ({category}). Title: {ctx.state.get('title')}"
+github_mcp = McpToolset(
+    connection_params=SseConnectionParams(
+        url="https://api.githubcopilot.com/mcp/",
+    ),
+    header_provider=lambda ctx=None: {
+        "Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN', '')}"
+    },
+)
+
+
+# --- Bug Pipeline Nodes ---
+
+
+def reproduce_bug(ctx: Context, node_input: Any) -> Event:
+    """Clones the repository at HEAD, builds it, isolates network, and runs pytest inside Docker."""
+    import logging
+    import traceback
+
+    logger = logging.getLogger("autopatch.reproduce_bug")
+
+    try:
+        repo_full_name = ctx.state.get("repo_full_name", "")
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+
+        if not repo_full_name:
+            logger.error("No repository specified in the context.")
+            return Event(
+                output=ReproductionResult(
+                    reproduced=False,
+                    failing_tests=[],
+                    traceback="No repository specified in the context.",
+                    reproduction_command="pytest --tb=short",
+                ),
+                actions={
+                    "state_delta": {
+                        "reproduced": False,
+                        "failing_tests": [],
+                        "reproducer_traceback": "No repository specified in the context.",
+                        "reproduction_command": "pytest --tb=short",
+                    }
+                },
+            )
+
+        logger.info("Initializing Docker client...")
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            err_msg = f"Docker client initialization failed: {e}"
+            logger.error(err_msg)
+            return Event(
+                output=ReproductionResult(
+                    reproduced=False,
+                    failing_tests=[],
+                    traceback=err_msg,
+                    reproduction_command="pytest --tb=short",
+                ),
+                actions={
+                    "state_delta": {
+                        "reproduced": False,
+                        "failing_tests": [],
+                        "reproducer_traceback": err_msg,
+                        "reproduction_command": "pytest --tb=short",
+                    }
+                },
+            )
+
+        image_name = "python:3.11"
+        logger.info("Pulling python:3.11 image...")
+        try:
+            client.images.pull(image_name)
+        except Exception as e:
+            err_msg = f"Failed to pull image {image_name}: {e}"
+            logger.error(err_msg)
+            return Event(
+                output=ReproductionResult(
+                    reproduced=False,
+                    failing_tests=[],
+                    traceback=err_msg,
+                    reproduction_command="pytest --tb=short",
+                ),
+                actions={
+                    "state_delta": {
+                        "reproduced": False,
+                        "failing_tests": [],
+                        "reproducer_traceback": err_msg,
+                        "reproduction_command": "pytest --tb=short",
+                    }
+                },
+            )
+
+        logger.info("Image pulled. Creating container...")
+        container = None
+        try:
+            container = client.containers.run(
+                image_name, "tail -f /dev/null", detach=True
+            )
+            logger.info(f"Container created: {container.id}")
+        except Exception as e:
+            err_msg = f"Failed to run container: {e}"
+            logger.error(err_msg)
+            return Event(
+                output=ReproductionResult(
+                    reproduced=False,
+                    failing_tests=[],
+                    traceback=err_msg,
+                    reproduction_command="pytest --tb=short",
+                ),
+                actions={
+                    "state_delta": {
+                        "reproduced": False,
+                        "failing_tests": [],
+                        "reproducer_traceback": err_msg,
+                        "reproduction_command": "pytest --tb=short",
+                    }
+                },
+            )
+
+        reproduced = False
+        failing_tests = []
+        traceback_str = ""
+        reproduction_command = "pytest --tb=short"
+
+        try:
+            logger.info(f"Cloning repo: {repo_full_name}...")
+            if github_token:
+                clone_url = f"https://x-access-token:{github_token}@github.com/{repo_full_name}.git"
+            else:
+                clone_url = f"https://github.com/{repo_full_name}.git"
+
+            clone_cmd = f"git clone {clone_url} repo"
+            exec_res = container.exec_run(f"bash -c '{clone_cmd}'")
+            if exec_res.exit_code != 0:
+                raise RuntimeError(
+                    f"Git clone failed with code {exec_res.exit_code}: {exec_res.output.decode('utf-8', errors='replace')}"
+                )
+
+            logger.info("Installing dependencies...")
+            install_cmd = (
+                "cd repo && "
+                "( [ ! -f requirements.txt ] || pip install -r requirements.txt ) && "
+                "( [ -f requirements.txt ] || [ ! -f pyproject.toml ] || pip install -e \".[test]\" --no-deps ) && "
+                "pip install pytest"
+            )
+            install_res = container.exec_run(f"bash -c '{install_cmd}'")
+            install_output = install_res.output.decode('utf-8', errors='replace')
+            if install_res.exit_code != 0:
+                logger.error(f"Dependency installation failed with code {install_res.exit_code}. Output:\n{install_output}")
+                raise RuntimeError(
+                    f"Dependency installation failed with code {install_res.exit_code}.\nOutput:\n{install_output}"
+                )
+
+            logger.info("Disconnecting networks...")
+            container.reload()
+            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            for net_name in list(networks.keys()):
+                try:
+                    network = client.networks.get(net_name)
+                    network.disconnect(container)
+                except Exception as e:
+                    logger.warning(f"Failed to disconnect network {net_name}: {e}")
+
+            logger.info("Running pytest inside container...")
+            test_res = container.exec_run(
+                "bash -c 'cd repo && python -m pytest --tb=short'"
+            )
+            exit_code = test_res.exit_code
+            stdout_stderr = test_res.output.decode("utf-8", errors="replace")
+            logger.info(f"Pytest exited with code {exit_code}")
+
+            if exit_code == 1:
+                reproduced = True
+
+            for line in stdout_stderr.splitlines():
+                if line.startswith("FAILED "):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        test_id = parts[1]
+                        failing_tests.append(test_id)
+
+            traceback_str = stdout_stderr
+
+        except Exception as e:
+            traceback_str = f"Error during reproduction: {e}\n{traceback_str}"
+            logger.exception("Exception inside container execution block")
+        finally:
+            if container:
+                try:
+                    logger.info("Stopping and removing container...")
+                    container.stop()
+                    container.remove()
+                except Exception as e:
+                    logger.warning(f"Failed to destroy container: {e}")
+
+        result = ReproductionResult(
+            reproduced=reproduced,
+            failing_tests=failing_tests,
+            traceback=traceback_str,
+            reproduction_command=reproduction_command,
+        )
+
+        state_delta = {
+            "reproduced": reproduced,
+            "failing_tests": failing_tests,
+            "reproducer_traceback": traceback_str,
+            "reproduction_command": reproduction_command,
+        }
+
+        return Event(output=result, actions={"state_delta": state_delta})
+
+    except Exception as e:
+        tb_str = traceback.format_exc()
+        logger.error(f"Critical error in reproduce_bug node: {e}\n{tb_str}")
+        result = ReproductionResult(
+            reproduced=False,
+            failing_tests=[],
+            traceback=f"Critical error in reproduce_bug node: {e}\n{tb_str}",
+            reproduction_command="pytest --tb=short",
+        )
+        state_delta = {
+            "reproduced": False,
+            "failing_tests": [],
+            "reproducer_traceback": f"Critical error in reproduce_bug node: {e}\n{tb_str}",
+            "reproduction_command": "pytest --tb=short",
+        }
+        return Event(output=result, actions={"state_delta": state_delta})
+
+
+def prepare_root_cause_input(ctx: Context, node_input: ReproductionResult) -> str:
+    """Formats the prompt for the analyze_root_cause LlmAgent."""
+    repo_full_name = ctx.state.get("repo_full_name", "")
+    issue_number = ctx.state.get("issue_number", "")
+    title = ctx.state.get("title", "")
+    sanitized_body = ctx.state.get("sanitized_body", "")
+
+    owner, repo = "", ""
+    if "/" in repo_full_name:
+        owner, repo = repo_full_name.split("/", 1)
+
+    reproduced_str = "Yes" if node_input.reproduced else "No"
+    failing_tests_str = (
+        ", ".join(node_input.failing_tests) if node_input.failing_tests else "None"
+    )
+
+    prompt = f"""We are triaging and debugging the following GitHub Issue:
+Repository: {repo_full_name} (Owner: '{owner}', Repo: '{repo}')
+Issue Number: {issue_number}
+Title: {title}
+
+Issue Description:
+{sanitized_body}
+
+Reproduction Results:
+- Reproduced: {reproduced_str}
+- Failing Tests: {failing_tests_str}
+- Execution output/traceback:
+{node_input.traceback}
+
+Your task is to analyze the root cause of this bug.
+Use the 'get_file_contents' tool to retrieve the contents of the files mentioned in the traceback (or related files in the repository).
+Remember:
+1. Provide the exact owner ('{owner}') and repo ('{repo}') arguments to the tool.
+2. Fetch ONLY the files that are relevant to the traceback. Do NOT retrieve the whole repository.
+Once you have retrieved the file contents and analyzed the bug, provide:
+1. An explanation of the root cause.
+2. The list of files that need to be modified (as a list of file paths relative to the repository root).
+"""
+    return prompt
+
+
+analyze_root_cause = LlmAgent(
+    name="analyze_root_cause",
+    model=CONFIG["MODEL_NAME"],
+    instruction="""You are an expert software developer.
+Analyze the provided issue, reproduction result, and traceback.
+Use the 'get_file_contents' tool to fetch files mentioned in the traceback.
+Identify the root cause of the bug and determine which files need to be modified to fix the issue.
+Conform exactly to the requested output schema.
+""",
+    tools=[github_mcp],
+    output_schema=RootCauseOutput,
+)
+
+
+def fetch_files_for_fix(ctx: Context, node_input: RootCauseOutput) -> Event:
+    """Helper node that downloads the files to modify using GitHub REST API."""
+    repo_full_name = ctx.state.get("repo_full_name", "")
+    owner, repo = "", ""
+    if "/" in repo_full_name:
+        owner, repo = repo_full_name.split("/", 1)
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    files_dict = {}
+    for path in node_input.files_to_modify:
+        try:
+            content = fetch_github_file(owner, repo, path, github_token)
+            files_dict[path] = content
+        except Exception as e:
+            files_dict[path] = f"Error fetching file: {e}"
+
+    # Format the prompt for propose_fix
+    prompt = f"Root cause explanation:\n{node_input.explanation}\n\nAllowed files to modify: {node_input.files_to_modify}\n\nFile contents:\n"
+    for path, content in files_dict.items():
+        prompt += f"\n--- File: {path} ---\n{content}\n"
+
+    prompt += "\nPlease propose a fix as a unified diff that ONLY modifies the allowed files. Do not modify any other files."
+
+    state_delta = {
+        "explanation": node_input.explanation,
+        "files_to_modify": node_input.files_to_modify,
+        "file_contents": files_dict,
+    }
+    return Event(output=prompt, actions={"state_delta": state_delta})
+
+
+propose_fix = LlmAgent(
+    name="propose_fix",
+    model=CONFIG["MODEL_NAME"],
+    instruction="""You are a senior software engineer.
+Propose a code fix for the bug based on the explanation and file contents.
+Output a unified diff of the changes. The diff must ONLY modify the files specified in the allowed files list.
+Do not modify any other files.
+Conform exactly to the requested output schema.
+""",
+    output_schema=FixProposal,
+)
+
+
+def validate_diff(ctx: Context, node_input: FixProposal) -> Event:
+    """Validates that the diff only modifies files in files_to_modify."""
+    diff_str = node_input.diff
+    modified_files = get_modified_files(diff_str)
+    allowed_files = ctx.state.get("files_to_modify", [])
+
+    if not modified_files:
+        error_msg = "Validation failed: No modified files found in the diff or the diff format is invalid. Please make sure to output a valid unified diff."
+        return _handle_retry_or_fail(ctx, error_msg)
+
+    for file in modified_files:
+        if file not in allowed_files:
+            error_msg = f"Validation failed: The diff modifies file '{file}', which is not in the allowed list of files to modify: {allowed_files}. Please ensure you only modify the allowed files."
+            return _handle_retry_or_fail(ctx, error_msg)
+
+    state_delta = {
+        "proposed_diff": diff_str,
+        "fix_explanation": node_input.explanation,
+        "validation_status": "success",
+    }
+    return Event(
+        output="Diff validated successfully.",
+        actions={"route": "success", "state_delta": state_delta},
+    )
+
+
+def _handle_retry_or_fail(ctx: Context, error_msg: str) -> Event:
+    retries = ctx.state.get("validation_retries", 0)
+    if retries < 3:
+        new_retries = retries + 1
+        state_delta = {"validation_retries": new_retries}
+        return Event(
+            output=error_msg, actions={"route": "retry", "state_delta": state_delta}
+        )
+    else:
+        state_delta = {"validation_status": "fail", "validation_error": error_msg}
+        return Event(
+            output=f"Validation failed after 3 retries: {error_msg}",
+            actions={"route": "fail", "state_delta": state_delta},
+        )
+
+
+# --- Non-Bug Pipeline Nodes ---
+
+
+def prepare_non_bug_input(ctx: Context, node_input: ClassificationOutput) -> str:
+    """Formats the prompt for the handle_non_bug LlmAgent."""
+    repo_full_name = ctx.state.get("repo_full_name", "")
+    issue_number = ctx.state.get("issue_number", "")
+    title = ctx.state.get("title", "")
+    sanitized_body = ctx.state.get("sanitized_body", "")
+
+    owner, repo = "", ""
+    if "/" in repo_full_name:
+        owner, repo = repo_full_name.split("/", 1)
+
+    prompt = f"""We are handling a non-bug GitHub Issue:
+Repository: {repo_full_name} (Owner: '{owner}', Repo: '{repo}')
+Issue Number: {issue_number}
+Title: {title}
+Classification: {node_input.classification}
+Severity: {node_input.severity}
+
+Issue Description:
+{sanitized_body}
+
+Please handle this issue:
+1. Add the classification '{node_input.classification}' (or another appropriate label) to this issue using the 'add_label_to_issue' tool.
+   Use the exact owner ('{owner}') and repo ('{repo}') arguments.
+2. Comment on this issue using 'create_issue_comment' explaining how it is classified and next steps.
+   Use the exact owner ('{owner}') and repo ('{repo}') arguments.
+"""
+    return prompt
+
+
+handle_non_bug = LlmAgent(
+    name="handle_non_bug",
+    model=CONFIG["MODEL_NAME"],
+    instruction="""You are an AI assistant helping to maintain a GitHub repository.
+You are handling a non-bug issue. Based on the issue details and classification:
+1. Choose an appropriate label (like 'docs', 'feature', etc.) and add it to the issue using the 'add_label_to_issue' tool.
+2. Add a helpful comment explaining that the issue has been classified as a non-bug and what the next steps are, using the 'create_issue_comment' tool.
+Conform exactly to the requested output schema.
+""",
+    tools=[github_mcp],
+    output_schema=NonBugOutput,
+)
 
 
 # --- Graph Wiring ---
@@ -354,15 +857,32 @@ root_agent = Workflow(
         ),
         # 4. Classify issue using LlmAgent
         (classify_issue, route_issue),
-        # 5. Deterministic routing
+        # 5. Route to appropriate pipeline or HITL
         (
             route_issue,
             {
-                "bug_pipeline": bug_pipeline,
+                "bug_pipeline": reproduce_bug,
                 "hitl_direct": human_approval,
-                "non_bug": non_bug,
+                "non_bug": prepare_non_bug_input,
             },
         ),
+        # Bug Pipeline branch
+        (reproduce_bug, prepare_root_cause_input),
+        (prepare_root_cause_input, analyze_root_cause),
+        (analyze_root_cause, fetch_files_for_fix),
+        (fetch_files_for_fix, propose_fix),
+        (propose_fix, validate_diff),
+        # Diff Validation Retry / Success / Fail Loops
+        (
+            validate_diff,
+            {
+                "retry": propose_fix,
+                "__DEFAULT__": human_approval,
+            },
+        ),
+        # Non-Bug Pipeline branch
+        (prepare_non_bug_input, handle_non_bug),
+        (handle_non_bug, human_approval),
     ],
 )
 
