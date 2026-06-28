@@ -1,5 +1,6 @@
 import base64
 import json
+import pytest
 
 from autopatch.agent import (
     ClassificationOutput,
@@ -21,6 +22,12 @@ from autopatch.agent import (
     scrub_secrets,
     security_screen,
     validate_diff,
+    security_audit,
+    semgrep_mcp,
+    open_pr,
+    github_mcp,
+    apply_patch,
+    parse_multi_file_diff,
 )
 
 
@@ -465,4 +472,281 @@ def test_reproduce_bug_install_failure(monkeypatch):
     assert event.output.reproduced is False
     assert "Dependency installation failed with code 1" in event.output.traceback
     assert "Pip installation failed spectacularly!" in event.output.traceback
+
+
+@pytest.mark.asyncio
+async def test_security_audit_clean(monkeypatch):
+    import asyncio
+    class MockToolDeclaration:
+        def __init__(self):
+            class MockParams:
+                def __init__(self):
+                    class MockProperties:
+                        def keys(self):
+                            return ["diff", "rules"]
+                    self.properties = MockProperties()
+            self.parameters = MockParams()
+
+    class MockTool:
+        def __init__(self):
+            self.name = "scan_diff"
+            self.description = "Scan diff"
+
+        def _get_declaration(self):
+            return MockToolDeclaration()
+
+        async def run_async(self, args, tool_context):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "[]"
+                    }
+                ]
+            }
+
+    async def mock_get_tools():
+        return [MockTool()]
+    monkeypatch.setattr(semgrep_mcp, "get_tools", mock_get_tools)
+
+    class MockContext:
+        def __init__(self, diff):
+            self.state = {"proposed_diff": diff}
+
+    ctx = MockContext("--- a/file.py\n+++ b/file.py\n+print('hello')")
+    event = await security_audit(ctx, None)
+    assert event.actions.state_delta["security_status"] == "clean"
+    assert event.actions.state_delta.get("security_event") is not True
+
+
+@pytest.mark.asyncio
+async def test_security_audit_critical(monkeypatch):
+    class MockToolDeclaration:
+        def __init__(self):
+            class MockParams:
+                def __init__(self):
+                    class MockProperties:
+                        def keys(self):
+                            return ["diff", "rules"]
+                    self.properties = MockProperties()
+            self.parameters = MockParams()
+
+    class MockTool:
+        def __init__(self):
+            self.name = "scan_diff"
+            self.description = "Scan diff"
+
+        def _get_declaration(self):
+            return MockToolDeclaration()
+
+        async def run_async(self, args, tool_context):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '[{"severity": "ERROR", "message": "Google API Key hardcoded"}]'
+                    }
+                ]
+            }
+
+    async def mock_get_tools():
+        return [MockTool()]
+    monkeypatch.setattr(semgrep_mcp, "get_tools", mock_get_tools)
+
+    class MockContext:
+        def __init__(self, diff):
+            self.state = {"proposed_diff": diff}
+
+    ctx = MockContext("--- a/file.py\n+++ b/file.py\n+api_key = 'AIzaSyFakeKey'")
+    event = await security_audit(ctx, None)
+    assert event.actions.state_delta["security_status"] == "critical"
+    assert event.actions.state_delta["security_event"] is True
+
+
+@pytest.mark.asyncio
+async def test_security_audit_fallback(monkeypatch):
+    # Mock get_tools to fail, triggering the fallback check
+    async def mock_get_tools_fail():
+        raise RuntimeError("Semgrep MCP is down!")
+    monkeypatch.setattr(semgrep_mcp, "get_tools", mock_get_tools_fail)
+
+    class MockContext:
+        def __init__(self, diff):
+            self.state = {"proposed_diff": diff}
+
+    # Case 1: Fallback matches API Key
+    ctx = MockContext("--- a/file.py\n+++ b/file.py\n+api_key = 'AIzaSyFakeKey'")
+    event = await security_audit(ctx, None)
+    assert event.actions.state_delta["security_status"] == "critical"
+    assert event.actions.state_delta["security_event"] is True
+
+    # Case 2: Fallback clean
+    ctx2 = MockContext("--- a/file.py\n+++ b/file.py\n+print('hello')")
+    event2 = await security_audit(ctx2, None)
+    assert event2.actions.state_delta["security_status"] == "error"
+    assert event2.actions.state_delta.get("security_event") is not True
+
+
+def test_parse_multi_file_diff():
+    diff_str = """--- a/file1.py
++++ b/file1.py
+@@ -1,3 +1,4 @@
+ line1
+-line2
++line2_patched
++line3
+--- a/file2.py
++++ b/file2.py
+@@ -5,2 +5,2 @@
+-foo
++bar
+"""
+    result = parse_multi_file_diff(diff_str)
+    assert "file1.py" in result
+    assert "file2.py" in result
+    assert "line2_patched" in result["file1.py"]
+    assert "bar" in result["file2.py"]
+
+
+def test_apply_patch():
+    original = "line1\nline2\nline3\n"
+    patch = """--- a/file1.py
++++ b/file1.py
+@@ -1,3 +1,3 @@
+ line1
+-line2
++line2_patched
+ line3
+"""
+    patched = apply_patch(original, patch)
+    assert patched == "line1\nline2_patched\nline3\n"
+
+
+@pytest.mark.asyncio
+async def test_open_pr_sequence(monkeypatch):
+    import json
+    
+    # We will mock github_mcp to return our tools
+    class MockToolDeclaration:
+        def __init__(self, params):
+            class MockParams:
+                def __init__(self, p):
+                    class MockProperties:
+                        def __init__(self, prop_keys):
+                            self._keys = prop_keys
+                        def keys(self):
+                            return self._keys
+                    self.properties = MockProperties(p)
+            self.parameters = MockParams(params)
+
+    class MockGetRepoTool:
+        def __init__(self):
+            self.name = "get_repository"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo"])
+            
+        async def run_async(self, args, tool_context):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"default_branch": "main"}'
+                    }
+                ]
+            }
+
+    class MockGetBranchTool:
+        def __init__(self):
+            self.name = "get_branch"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo", "branch"])
+            
+        async def run_async(self, args, tool_context):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"commit": {"sha": "latest-commit-sha"}}'
+                    }
+                ]
+            }
+
+    class MockCreateBranchTool:
+        def __init__(self):
+            self.name = "create_ref"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo", "ref", "sha"])
+            
+        async def run_async(self, args, tool_context):
+            return {"content": [{"type": "text", "text": "Branch created"}]}
+
+    class MockGetFileTool:
+        def __init__(self):
+            self.name = "get_file"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo", "path", "ref"])
+            
+        async def run_async(self, args, tool_context):
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": '{"content": "bGluZTEKbGluZTIKbGluZTMK", "encoding": "base64", "sha": "file-blob-sha"}'
+                    }
+                ]
+            }
+
+    class MockUpdateFileTool:
+        def __init__(self):
+            self.name = "update_file"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo", "path", "content", "message", "sha", "branch"])
+            
+        async def run_async(self, args, tool_context):
+            return {"content": [{"type": "text", "text": "File updated"}]}
+
+    class MockCreatePRTool:
+        def __init__(self):
+            self.name = "create_pull_request"
+            
+        def _get_declaration(self):
+            return MockToolDeclaration(["owner", "repo", "title", "body", "head", "base"])
+            
+        async def run_async(self, args, tool_context):
+            return {"content": [{"type": "text", "text": "PR-Created-Success"}]}
+
+    async def mock_get_tools():
+        return [
+            MockGetRepoTool(),
+            MockGetBranchTool(),
+            MockCreateBranchTool(),
+            MockGetFileTool(),
+            MockUpdateFileTool(),
+            MockCreatePRTool()
+        ]
+        
+    monkeypatch.setattr(github_mcp, "get_tools", mock_get_tools)
+
+    class MockContext:
+        def __init__(self):
+            self.state = {
+                "repo_full_name": "owner/repo",
+                "issue_number": "123",
+                "explanation": "Bug in main loop",
+                "fix_explanation": "Fix loop condition",
+                "security_findings": "Clean",
+                "proposed_diff": "--- a/file1.py\n+++ b/file1.py\n@@ -1,3 +1,3 @@\n line1\n-line2\n+line2_patched\n line3\n"
+            }
+
+    ctx = MockContext()
+    event = await open_pr(ctx, None)
+    assert event.actions.state_delta["pull_request_created"] is True
+    assert "PR-Created-Success" in event.output
+
+
 

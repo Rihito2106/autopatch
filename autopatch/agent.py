@@ -28,7 +28,8 @@ from pydantic import BaseModel, Field, model_validator
 import docker
 import requests
 from google.adk.tools.mcp_tool import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams
+from google.adk.tools.mcp_tool.mcp_session_manager import SseConnectionParams, StdioConnectionParams
+from mcp import StdioServerParameters
 
 from google.adk.workflow import Workflow, node, START
 from google.adk.agents import LlmAgent
@@ -406,18 +407,55 @@ def route_issue(node_input: ClassificationOutput) -> Event:
 
 @node(rerun_on_resume=True)
 async def human_approval(ctx: Context, node_input: Any) -> Event:
-    """HITL step requesting human authorization."""
+    """HITL step requesting human authorization with full reviewer package."""
     if not ctx.resume_inputs or "approved" not in ctx.resume_inputs:
+        title = ctx.state.get("title", "")
+        body = ctx.state.get("sanitized_body", "")
+        explanation = ctx.state.get("explanation", "")
+        diff = ctx.state.get("proposed_diff", "")
+        security_findings = ctx.state.get("security_findings", "")
+        security_status = ctx.state.get("security_status", "")
+        repro_cmd = ctx.state.get("reproduction_command", "")
+
+        msg = f"=== ACTION REQUIRED: Human Review ===\n"
+        msg += f"Issue Title: {title}\n"
+        msg += f"Issue Body:\n{body}\n\n"
+
+        if explanation:
+            msg += f"## Root Cause Summary\n{explanation}\n\n"
+
+        if diff:
+            msg += f"## Proposed Changes\n```diff\n{diff}\n```\n\n"
+
+        if security_findings:
+            flag = "🚨 CRITICAL FINDINGS DETECTED 🚨" if security_status == "critical" else "⚠️ WARNING FINDINGS"
+            msg += f"## Security Audit ({flag})\n{security_findings}\n\n"
+
+        if repro_cmd:
+            msg += f"## Reproduction Command\n`{repro_cmd}`\n\n"
+
+        msg += "Please review the proposed patch and select response options:\n"
+        msg += "- 'approve' to open a Pull Request\n"
+        msg += "- 'reject' to close the issue with a rejection comment."
+
         yield RequestInput(
             interrupt_id="approved",
-            message=f"Action required: Human review needed. Issue title: {ctx.state.get('title')}. Please approve.",
+            message=msg,
         )
         return
 
     approved = ctx.resume_inputs["approved"]
+    approved_str = str(approved).strip().lower()
+
+    # Route: approve -> open_pr; reject -> close_with_comment
+    route = "approve" if approved_str == "approve" else "reject"
+
     yield Event(
-        output=f"Human review completed. Approved: {approved}",
-        actions={"state_delta": {"human_approved": approved}},
+        output=f"Human review completed. Chosen action: {route}",
+        actions={
+            "route": route,
+            "state_delta": {"human_approved": approved_str}
+        },
     )
 
 
@@ -431,6 +469,16 @@ github_mcp = McpToolset(
     header_provider=lambda ctx=None: {
         "Authorization": f"Bearer {os.environ.get('GITHUB_TOKEN', '')}"
     },
+)
+
+
+semgrep_mcp = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uvx",
+            args=["semgrep-mcp"],
+        )
+    )
 )
 
 
@@ -840,6 +888,715 @@ Conform exactly to the requested output schema.
 )
 
 
+async def security_audit(ctx: Context, node_input: Any) -> Event:
+    """Runs a Semgrep security audit on the proposed diff before human approval."""
+    import json
+    import logging
+    import re
+    logger = logging.getLogger("autopatch.security_audit")
+
+    diff_str = ctx.state.get("proposed_diff", "")
+    if not diff_str:
+        logger.warning("No proposed diff found in state to audit.")
+        return Event(
+            output="No diff to audit.",
+            actions={"state_delta": {"security_findings": [], "security_status": "clean"}}
+        )
+
+    logger.info("Initializing Semgrep MCP and fetching tools...")
+    try:
+        tools = await semgrep_mcp.get_tools()
+        scan_diff_tool = next((t for t in tools if t.name == "scan_diff"), None)
+        if not scan_diff_tool:
+            raise RuntimeError("Semgrep MCP tool 'scan_diff' not found.")
+
+        custom_rule = {
+            "id": "detect-google-api-key",
+            "pattern-regex": "AIzaSy[A-Za-z0-9_-]*",
+            "message": "Hardcoded Google API key prefix detected",
+            "severity": "ERROR",
+            "languages": ["generic"]
+        }
+
+        decl = scan_diff_tool._get_declaration()
+        param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+
+        args = {}
+        if "diff" in param_names:
+            args["diff"] = diff_str
+        elif "git_diff" in param_names:
+            args["git_diff"] = diff_str
+        elif "diff_content" in param_names:
+            args["diff_content"] = diff_str
+        else:
+            args[param_names[0] if param_names else "diff"] = diff_str
+
+        if "rules" in param_names:
+            args["rules"] = [custom_rule, "owasp-top-10"]
+        elif "config" in param_names:
+            args["config"] = [custom_rule, "owasp-top-10"]
+        else:
+            args["rules"] = [custom_rule, "owasp-top-10"]
+
+        logger.info(f"Calling scan_diff tool with parameters: {list(args.keys())}")
+        result = await scan_diff_tool.run_async(args=args, tool_context=ctx)
+
+        findings = []
+        has_critical = False
+        has_warning = False
+        raw_text = ""
+
+        if isinstance(result, dict):
+            content_list = result.get("content", [])
+            for block in content_list:
+                if block.get("type") == "text" and block.get("text"):
+                    text = block["text"]
+                    raw_text += text + "\n"
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, list):
+                            findings.extend(parsed)
+                        elif isinstance(parsed, dict):
+                            if "findings" in parsed:
+                                findings.extend(parsed["findings"])
+                            else:
+                                findings.append(parsed)
+                    except Exception:
+                        pass
+
+        for f in findings:
+            severity = str(f.get("severity", "")).upper()
+            if severity in ("CRITICAL", "ERROR"):
+                has_critical = True
+            elif severity == "WARNING":
+                has_warning = True
+
+        if "CRITICAL" in raw_text.upper() or "ERROR" in raw_text.upper() or "AIZASY" in raw_text.upper():
+            has_critical = True
+        elif "WARNING" in raw_text.upper():
+            has_warning = True
+
+        logger.info(f"Security audit complete. Critical={has_critical}, Warning={has_warning}")
+
+        if has_critical:
+            state_delta = {
+                "security_event": True,
+                "security_findings": findings if findings else raw_text,
+                "security_status": "critical"
+            }
+            return Event(
+                output=f"🚨 SECURITY AUDIT FAILED (CRITICAL):\n{raw_text or findings}",
+                actions={"state_delta": state_delta}
+            )
+        elif has_warning:
+            state_delta = {
+                "security_findings": findings if findings else raw_text,
+                "security_status": "warning"
+            }
+            return Event(
+                output=f"⚠️ SECURITY AUDIT WARNING:\n{raw_text or findings}",
+                actions={"state_delta": state_delta}
+            )
+        else:
+            state_delta = {
+                "security_findings": [],
+                "security_status": "clean"
+            }
+            return Event(
+                output="✅ Security audit clean. No issues found.",
+                actions={"state_delta": state_delta}
+            )
+
+    except Exception as e:
+        logger.error(f"Error during security audit: {e}", exc_info=True)
+        # Fallback check
+        api_key_regex = re.compile(r"AIzaSy[A-Za-z0-9_-]*")
+        matches = api_key_regex.findall(diff_str)
+        if matches:
+            state_delta = {
+                "security_event": True,
+                "security_findings": [f"Fallback regex matched API key prefix: {matches}"],
+                "security_status": "critical"
+            }
+            return Event(
+                output=f"🚨 SECURITY AUDIT FAILED (CRITICAL - Fallback Check):\nFound hardcoded Google API key prefixes: {matches}",
+                actions={"state_delta": state_delta}
+            )
+        else:
+            state_delta = {
+                "security_findings": [f"Security audit error: {e}"],
+                "security_status": "error"
+            }
+            return Event(
+                output=f"⚠️ Security audit errored out: {e}. Pass through as clean.",
+                actions={"state_delta": state_delta}
+            )
+
+
+def parse_multi_file_diff(diff_str: str) -> dict[str, str]:
+    """Parses a multi-file unified diff into a dict mapping file path to the diff of that file."""
+    file_diffs = {}
+    current_file = None
+    current_lines = []
+    
+    for line in diff_str.splitlines():
+        if line.startswith('--- a/') or line.startswith('--- '):
+            if current_file and current_lines:
+                file_diffs[current_file] = '\n'.join(current_lines)
+            if line.startswith('--- a/'):
+                current_file = line[6:]
+            else:
+                current_file = line[4:]
+            current_file = current_file.split('\t')[0].strip()
+            current_lines = [line]
+        elif line.startswith('+++ b/') or line.startswith('+++ '):
+            if current_file:
+                current_lines.append(line)
+        elif current_file is not None:
+            current_lines.append(line)
+            
+    if current_file and current_lines:
+        file_diffs[current_file] = '\n'.join(current_lines)
+        
+    return file_diffs
+
+
+def apply_patch(original_content: str, patch_str: str) -> str:
+    """Applies a unified diff patch to the original content string."""
+    lines = original_content.splitlines(keepends=True)
+    patch_lines = patch_str.splitlines()
+    
+    hunks = []
+    current_hunk = None
+    
+    i = 0
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if line.startswith('@@'):
+            parts = line.split()
+            old_part = parts[1]
+            new_part = parts[2]
+            
+            old_start = int(old_part[1:].split(',')[0])
+            new_start = int(new_part[1:].split(',')[0])
+            
+            current_hunk = {
+                'old_start': old_start,
+                'new_start': new_start,
+                'lines': []
+            }
+            hunks.append(current_hunk)
+        elif current_hunk is not None:
+            if line.startswith('\\'):
+                pass
+            else:
+                current_hunk['lines'].append(line)
+        i += 1
+
+    hunks.sort(key=lambda h: h['old_start'], reverse=True)
+    
+    for hunk in hunks:
+        old_start = hunk['old_start']
+        hunk_lines = hunk['lines']
+        
+        expected_old = []
+        new_lines_to_insert = []
+        
+        for hl in hunk_lines:
+            if hl.startswith(' '):
+                expected_old.append(hl[1:])
+                new_lines_to_insert.append(hl[1:])
+            elif hl.startswith('-'):
+                expected_old.append(hl[1:])
+            elif hl.startswith('+'):
+                new_lines_to_insert.append(hl[1:])
+        
+        start_idx = old_start - 1
+        matched_idx = -1
+        
+        search_radius = 200
+        for offset in range(search_radius):
+            for sign in [1, -1] if offset > 0 else [1]:
+                idx = start_idx + sign * offset
+                if 0 <= idx <= len(lines) - len(expected_old):
+                    match = True
+                    for j, exp in enumerate(expected_old):
+                        actual = lines[idx + j].rstrip('\r\n')
+                        if actual != exp.rstrip('\r\n'):
+                            match = False
+                            break
+                    if match:
+                        matched_idx = idx
+                        break
+            if matched_idx != -1:
+                break
+                
+        if matched_idx == -1:
+            matched_idx = max(0, min(start_idx, len(lines)))
+            
+        replacement = []
+        for nl in new_lines_to_insert:
+            replacement.append(nl + '\n')
+            
+        lines[matched_idx : matched_idx + len(expected_old)] = replacement
+
+    return "".join(lines)
+
+
+async def get_default_branch_and_sha(ctx: Context, owner: str, repo: str) -> tuple[str, str]:
+    """Returns (default_branch_name, latest_sha)."""
+    import json
+    import os
+    import requests
+    import logging
+    logger = logging.getLogger("autopatch.open_pr.get_default_branch")
+
+    try:
+        tools = await github_mcp.get_tools()
+        get_repo_tool = next((t for t in tools if "get_repository" in t.name or "get_repo" in t.name), None)
+        if get_repo_tool:
+            args = {"owner": owner, "repo": repo}
+            result = await get_repo_tool.run_async(args=args, tool_context=ctx)
+            default_branch = ""
+            if isinstance(result, dict):
+                for block in result.get("content", []):
+                    if block.get("type") == "text" and block.get("text"):
+                        try:
+                            data = json.loads(block["text"])
+                            if isinstance(data, dict):
+                                default_branch = data.get("default_branch", "")
+                        except Exception:
+                            pass
+            
+            if default_branch:
+                get_branch_tool = next((t for t in tools if "get_branch" in t.name or "get_ref" in t.name), None)
+                if get_branch_tool:
+                    decl = get_branch_tool._get_declaration()
+                    param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+                    args = {"owner": owner, "repo": repo}
+                    if "branch" in param_names:
+                        args["branch"] = default_branch
+                    elif "ref" in param_names:
+                        args["ref"] = f"heads/{default_branch}"
+                    
+                    branch_result = await get_branch_tool.run_async(args=args, tool_context=ctx)
+                    sha = ""
+                    if isinstance(branch_result, dict):
+                        for block in branch_result.get("content", []):
+                            if block.get("type") == "text" and block.get("text"):
+                                try:
+                                    b_data = json.loads(block["text"])
+                                    if isinstance(b_data, dict):
+                                        if "commit" in b_data:
+                                            sha = b_data["commit"].get("sha", "")
+                                        elif "object" in b_data:
+                                            sha = b_data["object"].get("sha", "")
+                                        elif "sha" in b_data:
+                                            sha = b_data.get("sha", "")
+                                except Exception:
+                                    pass
+                    if sha:
+                        return default_branch, sha
+    except Exception as e:
+        logger.warning(f"Failed to get default branch via MCP: {e}. Trying REST API...")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    repo_url = f"https://api.github.com/repos/{owner}/{repo}"
+    resp = requests.get(repo_url, headers=headers)
+    if resp.status_code == 200:
+        repo_data = resp.json()
+        default_branch = repo_data.get("default_branch", "main")
+        
+        branch_url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}"
+        branch_resp = requests.get(branch_url, headers=headers)
+        if branch_resp.status_code == 200:
+            branch_data = branch_resp.json()
+            sha = branch_data.get("object", {}).get("sha", "")
+            return default_branch, sha
+            
+    raise RuntimeError("Failed to retrieve default branch and latest commit SHA.")
+
+
+async def create_branch_via_mcp_or_api(ctx: Context, owner: str, repo: str, branch_name: str, sha: str):
+    """Creates a new branch on GitHub from the specified commit SHA."""
+    import os
+    import requests
+    import logging
+    logger = logging.getLogger("autopatch.open_pr.create_branch")
+    ref_name = f"refs/heads/{branch_name}"
+    try:
+        tools = await github_mcp.get_tools()
+        create_ref_tool = next((t for t in tools if "create_ref" in t.name or "create_branch" in t.name or "create_reference" in t.name), None)
+        if create_ref_tool:
+            decl = create_ref_tool._get_declaration()
+            param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+            args = {"owner": owner, "repo": repo, "sha": sha}
+            if "ref" in param_names:
+                args["ref"] = ref_name
+            elif "branch" in param_names:
+                args["branch"] = branch_name
+            elif "name" in param_names:
+                args["name"] = branch_name
+                
+            await create_ref_tool.run_async(args=args, tool_context=ctx)
+            logger.info(f"Branch '{branch_name}' created via MCP.")
+            return
+    except Exception as e:
+        logger.warning(f"Failed to create branch via MCP: {e}. Trying REST API...")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    url = f"https://api.github.com/repos/{owner}/{repo}/git/refs"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    data = {
+        "ref": ref_name,
+        "sha": sha
+    }
+    resp = requests.post(url, headers=headers, json=data)
+    if resp.status_code in (201, 200):
+        logger.info(f"Branch '{branch_name}' created via REST API.")
+    elif resp.status_code == 422 and "already exists" in resp.text:
+        logger.info(f"Branch '{branch_name}' already exists.")
+    else:
+        raise RuntimeError(f"Failed to create branch '{branch_name}': {resp.status_code} - {resp.text}")
+
+
+async def fetch_file_content_via_mcp_or_api(ctx: Context, owner: str, repo: str, path: str, ref: str) -> tuple[str, str]:
+    """Fetches original file content and its blob SHA. Returns (content, sha)."""
+    import os
+    import requests
+    import base64
+    import json
+    import logging
+    logger = logging.getLogger("autopatch.open_pr.fetch_file_content")
+
+    try:
+        tools = await github_mcp.get_tools()
+        get_file_tool = next((t for t in tools if "get_file" in t.name or "get_contents" in t.name), None)
+        if get_file_tool:
+            decl = get_file_tool._get_declaration()
+            param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+            args = {"owner": owner, "repo": repo, "path": path}
+            if "ref" in param_names:
+                args["ref"] = ref
+            elif "branch" in param_names:
+                args["branch"] = ref
+            
+            result = await get_file_tool.run_async(args=args, tool_context=ctx)
+            content_str = ""
+            sha = ""
+            if isinstance(result, dict):
+                for block in result.get("content", []):
+                    if block.get("type") == "text" and block.get("text"):
+                        try:
+                            data = json.loads(block["text"])
+                            if isinstance(data, dict):
+                                sha = data.get("sha", "")
+                                raw_content = data.get("content", "")
+                                encoding = data.get("encoding", "")
+                                if encoding == "base64":
+                                    content_str = base64.b64decode(raw_content).decode("utf-8")
+                                else:
+                                    content_str = raw_content
+                        except Exception:
+                            pass
+            if content_str:
+                return content_str, sha
+    except Exception as e:
+        logger.warning(f"Failed to get file contents via MCP: {e}. Trying REST API...")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    params = {"ref": ref}
+    resp = requests.get(url, headers=headers, params=params)
+    if resp.status_code == 200:
+        data = resp.json()
+        sha = data.get("sha", "")
+        raw_content = data.get("content", "")
+        encoding = data.get("encoding", "")
+        if encoding == "base64":
+            content_str = base64.b64decode(raw_content).decode("utf-8")
+        else:
+            content_str = raw_content
+        return content_str, sha
+    else:
+        raise RuntimeError(f"Failed to fetch file contents for {path}: {resp.status_code} - {resp.text}")
+
+
+async def commit_file_change_via_mcp_or_api(
+    ctx: Context, owner: str, repo: str, path: str, content: str, sha: str, branch_name: str, commit_msg: str
+):
+    """Commits a file update to the specified branch."""
+    import os
+    import requests
+    import base64
+    import logging
+    logger = logging.getLogger("autopatch.open_pr.commit_file_change")
+
+    try:
+        tools = await github_mcp.get_tools()
+        update_file_tool = next(
+            (t for t in tools if "update_file" in t.name or "create_or_update_file" in t.name or "commit" in t.name),
+            None
+        )
+        if update_file_tool:
+            decl = update_file_tool._get_declaration()
+            param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+            args = {
+                "owner": owner,
+                "repo": repo,
+                "path": path,
+                "content": content,
+                "message": commit_msg,
+                "sha": sha
+            }
+            if "branch" in param_names:
+                args["branch"] = branch_name
+            elif "ref" in param_names:
+                args["ref"] = branch_name
+            
+            await update_file_tool.run_async(args=args, tool_context=ctx)
+            logger.info(f"Committed '{path}' to branch '{branch_name}' via MCP.")
+            return
+    except Exception as e:
+        logger.warning(f"Failed to commit '{path}' via MCP: {e}. Trying REST API...")
+
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    
+    encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+    
+    data = {
+        "message": commit_msg,
+        "content": encoded_content,
+        "branch": branch_name,
+        "sha": sha
+    }
+    resp = requests.put(url, headers=headers, json=data)
+    if resp.status_code in (200, 201):
+        logger.info(f"Committed '{path}' to branch '{branch_name}' via REST API.")
+    else:
+        raise RuntimeError(f"Failed to commit '{path}' via REST API: {resp.status_code} - {resp.text}")
+
+
+async def open_pr(ctx: Context, node_input: Any) -> Event:
+    """Creates a branch, commits the patch files, and opens a pull request using GitHub MCP tools or REST API fallback."""
+    import logging
+    import os
+    import requests
+    logger = logging.getLogger("autopatch.open_pr")
+
+    repo_full_name = ctx.state.get("repo_full_name", "")
+    owner, repo = "", ""
+    if "/" in repo_full_name:
+        owner, repo = repo_full_name.split("/", 1)
+
+    issue_number = ctx.state.get("issue_number", "")
+    root_cause_summary = ctx.state.get("explanation", "")
+    explanation = ctx.state.get("fix_explanation", "")
+    security_findings = ctx.state.get("security_findings", "")
+    diff_str = ctx.state.get("proposed_diff", "")
+
+    branch_name = f"autopatch/issue-{issue_number}"
+
+    # Parse multi-file diff to get patch chunks per file
+    file_diffs = parse_multi_file_diff(diff_str)
+
+    # 1. Get default branch name and its latest commit SHA
+    default_branch, latest_sha = await get_default_branch_and_sha(ctx, owner, repo)
+    logger.info(f"Default branch: {default_branch}, Latest SHA: {latest_sha}")
+
+    # 2. Create the target branch from the latest SHA of the default branch
+    await create_branch_via_mcp_or_api(ctx, owner, repo, branch_name, latest_sha)
+
+    # 3. For each file in the diff, fetch current file blob SHA, apply patch, and commit
+    for filepath, file_diff in file_diffs.items():
+        logger.info(f"Applying patch to {filepath}...")
+        try:
+            orig_content, file_sha = await fetch_file_content_via_mcp_or_api(ctx, owner, repo, filepath, default_branch)
+            patched_content = apply_patch(orig_content, file_diff)
+            commit_msg = f"Fix issue #{issue_number}: patch {filepath}"
+            await commit_file_change_via_mcp_or_api(ctx, owner, repo, filepath, patched_content, file_sha, branch_name, commit_msg)
+        except Exception as e:
+            logger.error(f"Error patching file {filepath}: {e}", exc_info=True)
+            raise RuntimeError(f"Failed to apply patch to file {filepath}: {e}")
+
+    # 4. Create Pull Request
+    pr_body = (
+        f"Closes #{issue_number}\n\n"
+        f"## Root Cause\n{root_cause_summary}\n\n"
+        f"## Changes\n{explanation}\n\n"
+        f"## Security Audit\n{security_findings}\n\n"
+        f"---\n*Generated by AutoPatch. Reviewed and approved.*"
+    )
+
+    output_msg = ""
+    try:
+        tools = await github_mcp.get_tools()
+        pr_tool = next((t for t in tools if "create_pull_request" in t.name or "pull_request" in t.name or "pr" in t.name), None)
+        if not pr_tool:
+            raise RuntimeError("GitHub MCP tool for creating pull request not found.")
+
+        decl = pr_tool._get_declaration()
+        param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+
+        args = {}
+        if "owner" in param_names:
+            args["owner"] = owner
+        if "repo" in param_names:
+            args["repo"] = repo
+        if "title" in param_names:
+            args["title"] = f"AutoPatch Fix: Issue #{issue_number}"
+
+        if "body" in param_names:
+            args["body"] = pr_body
+        elif "description" in param_names:
+            args["description"] = pr_body
+
+        if "head" in param_names:
+            args["head"] = branch_name
+        if "base" in param_names:
+            args["base"] = default_branch
+
+        result = await pr_tool.run_async(args=args, tool_context=ctx)
+        logger.info(f"PR created successfully via MCP: {result}")
+        output_msg = f"Pull Request created successfully. Result: {result}"
+    except Exception as e:
+        logger.error(f"Failed to create PR via MCP: {e}. Attempting fallback via GitHub REST API...")
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+        if github_token and owner and repo:
+            url = f"https://api.github.com/repos/{owner}/{repo}/pulls"
+            headers = {
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            data = {
+                "title": f"AutoPatch Fix: Issue #{issue_number}",
+                "body": pr_body,
+                "head": branch_name,
+                "base": default_branch
+            }
+            resp = requests.post(url, headers=headers, json=data)
+            if resp.status_code in (200, 201):
+                pr_info = resp.json()
+                logger.info(f"PR created successfully via fallback: {pr_info.get('html_url')}")
+                output_msg = f"Pull Request created successfully via fallback: {pr_info.get('html_url')}"
+            else:
+                logger.error(f"Fallback PR creation failed: {resp.status_code} - {resp.text}")
+                raise RuntimeError(f"Failed to create Pull Request: {resp.text}")
+        else:
+            raise RuntimeError(f"Failed to create PR via MCP: {e} and fallback not possible.")
+
+    return Event(output=output_msg, actions={"state_delta": {"pull_request_created": True}})
+
+
+async def close_with_comment(ctx: Context, node_input: Any) -> Event:
+    """Closes the issue with a comment explaining the rejection."""
+    import logging
+    import os
+    import requests
+    logger = logging.getLogger("autopatch.close_with_comment")
+
+    repo_full_name = ctx.state.get("repo_full_name", "")
+    owner, repo = "", ""
+    if "/" in repo_full_name:
+        owner, repo = repo_full_name.split("/", 1)
+
+    issue_number = ctx.state.get("issue_number", "")
+    comment_body = "The proposed fix for this issue was reviewed and rejected by the human reviewer. Re-evaluating or closing task."
+
+    output_msg = ""
+    try:
+        tools = await github_mcp.get_tools()
+        comment_tool = next((t for t in tools if "create_issue_comment" in t.name or "create_comment" in t.name or "comment" in t.name), None)
+        if not comment_tool:
+            raise RuntimeError("GitHub MCP tool for creating comment not found.")
+
+        decl = comment_tool._get_declaration()
+        param_names = list(decl.parameters.properties.keys()) if decl and decl.parameters else []
+
+        args = {}
+        if "owner" in param_names:
+            args["owner"] = owner
+        if "repo" in param_names:
+            args["repo"] = repo
+        if "issue_number" in param_names:
+            args["issue_number"] = issue_number
+        elif "number" in param_names:
+            args["number"] = issue_number
+        elif "issue" in param_names:
+            args["issue"] = issue_number
+
+        if "body" in param_names:
+            args["body"] = comment_body
+        elif "text" in param_names:
+            args["text"] = comment_body
+
+        result = await comment_tool.run_async(args=args, tool_context=ctx)
+        logger.info(f"Rejection comment posted via MCP: {result}")
+        output_msg = f"Rejection comment posted successfully. Result: {result}"
+    except Exception as e:
+        logger.error(f"Failed to post comment via MCP: {e}. Attempting fallback via GitHub REST API...")
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+        if github_token and owner and repo:
+            url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}/comments"
+            headers = {
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            data = {"body": comment_body}
+            resp = requests.post(url, headers=headers, json=data)
+            if resp.status_code in (200, 201):
+                logger.info("Rejection comment posted via fallback REST API.")
+                output_msg = "Rejection comment posted successfully via fallback."
+            else:
+                logger.error(f"Fallback comment posting failed: {resp.status_code} - {resp.text}")
+                raise RuntimeError(f"Failed to post comment: {resp.text}")
+        else:
+            raise RuntimeError(f"Failed to post comment via MCP: {e} and fallback not possible.")
+
+    # Also close the issue
+    try:
+        github_token = os.environ.get("GITHUB_TOKEN", "")
+        if github_token and owner and repo:
+            url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_number}"
+            headers = {
+                "Authorization": f"Bearer {github_token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28"
+            }
+            data = {"state": "closed"}
+            resp = requests.patch(url, headers=headers, json=data)
+            if resp.status_code in (200, 201):
+                logger.info("Issue closed successfully via REST API.")
+            else:
+                logger.warning(f"Failed to close issue via REST API: {resp.status_code} - {resp.text}")
+    except Exception as ex:
+        logger.warning(f"Error trying to close issue: {ex}")
+
+    return Event(output=output_msg, actions={"state_delta": {"rejection_comment_posted": True}})
+
+
 # --- Graph Wiring ---
 
 root_agent = Workflow(
@@ -877,8 +1634,18 @@ root_agent = Workflow(
             validate_diff,
             {
                 "retry": propose_fix,
+                "success": security_audit,
                 "__DEFAULT__": human_approval,
             },
+        ),
+        (security_audit, human_approval),
+        # HITL Resolution routing
+        (
+            human_approval,
+            {
+                "approve": open_pr,
+                "reject": close_with_comment,
+            }
         ),
         # Non-Bug Pipeline branch
         (prepare_non_bug_input, handle_non_bug),
