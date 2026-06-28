@@ -1038,7 +1038,7 @@ def parse_multi_file_diff(diff_str: str) -> dict[str, str]:
     file_diffs = {}
     current_file = None
     current_lines = []
-    
+
     for line in diff_str.splitlines():
         if line.startswith('--- a/') or line.startswith('--- '):
             if current_file and current_lines:
@@ -1054,10 +1054,10 @@ def parse_multi_file_diff(diff_str: str) -> dict[str, str]:
                 current_lines.append(line)
         elif current_file is not None:
             current_lines.append(line)
-            
+
     if current_file and current_lines:
         file_diffs[current_file] = '\n'.join(current_lines)
-        
+
     return file_diffs
 
 
@@ -1065,10 +1065,10 @@ def apply_patch(original_content: str, patch_str: str) -> str:
     """Applies a unified diff patch to the original content string."""
     lines = original_content.splitlines(keepends=True)
     patch_lines = patch_str.splitlines()
-    
+
     hunks = []
     current_hunk = None
-    
+
     i = 0
     while i < len(patch_lines):
         line = patch_lines[i]
@@ -1076,10 +1076,10 @@ def apply_patch(original_content: str, patch_str: str) -> str:
             parts = line.split()
             old_part = parts[1]
             new_part = parts[2]
-            
+
             old_start = int(old_part[1:].split(',')[0])
             new_start = int(new_part[1:].split(',')[0])
-            
+
             current_hunk = {
                 'old_start': old_start,
                 'new_start': new_start,
@@ -1094,14 +1094,14 @@ def apply_patch(original_content: str, patch_str: str) -> str:
         i += 1
 
     hunks.sort(key=lambda h: h['old_start'], reverse=True)
-    
+
     for hunk in hunks:
         old_start = hunk['old_start']
         hunk_lines = hunk['lines']
-        
+
         expected_old = []
         new_lines_to_insert = []
-        
+
         for hl in hunk_lines:
             if hl.startswith(' '):
                 expected_old.append(hl[1:])
@@ -1110,10 +1110,10 @@ def apply_patch(original_content: str, patch_str: str) -> str:
                 expected_old.append(hl[1:])
             elif hl.startswith('+'):
                 new_lines_to_insert.append(hl[1:])
-        
+
         start_idx = old_start - 1
         matched_idx = -1
-        
+
         search_radius = 200
         for offset in range(search_radius):
             for sign in [1, -1] if offset > 0 else [1]:
@@ -1130,14 +1130,14 @@ def apply_patch(original_content: str, patch_str: str) -> str:
                         break
             if matched_idx != -1:
                 break
-                
+
         if matched_idx == -1:
             matched_idx = max(0, min(start_idx, len(lines)))
-            
+
         replacement = []
         for nl in new_lines_to_insert:
             replacement.append(nl + '\n')
-            
+
         lines[matched_idx : matched_idx + len(expected_old)] = replacement
 
     return "".join(lines)
@@ -1167,7 +1167,7 @@ async def get_default_branch_and_sha(ctx: Context, owner: str, repo: str) -> tup
                                 default_branch = data.get("default_branch", "")
                         except Exception:
                             pass
-            
+
             if default_branch:
                 get_branch_tool = next((t for t in tools if "get_branch" in t.name or "get_ref" in t.name), None)
                 if get_branch_tool:
@@ -1178,7 +1178,7 @@ async def get_default_branch_and_sha(ctx: Context, owner: str, repo: str) -> tup
                         args["branch"] = default_branch
                     elif "ref" in param_names:
                         args["ref"] = f"heads/{default_branch}"
-                    
+
                     branch_result = await get_branch_tool.run_async(args=args, tool_context=ctx)
                     sha = ""
                     if isinstance(branch_result, dict):
@@ -1211,14 +1211,14 @@ async def get_default_branch_and_sha(ctx: Context, owner: str, repo: str) -> tup
     if resp.status_code == 200:
         repo_data = resp.json()
         default_branch = repo_data.get("default_branch", "main")
-        
+
         branch_url = f"https://api.github.com/repos/{owner}/{repo}/git/ref/heads/{default_branch}"
         branch_resp = requests.get(branch_url, headers=headers)
         if branch_resp.status_code == 200:
             branch_data = branch_resp.json()
             sha = branch_data.get("object", {}).get("sha", "")
             return default_branch, sha
-            
+
     raise RuntimeError("Failed to retrieve default branch and latest commit SHA.")
 
 
@@ -1242,7 +1242,7 @@ async def create_branch_via_mcp_or_api(ctx: Context, owner: str, repo: str, bran
                 args["branch"] = branch_name
             elif "name" in param_names:
                 args["name"] = branch_name
-                
+
             await create_ref_tool.run_async(args=args, tool_context=ctx)
             logger.info(f"Branch '{branch_name}' created via MCP.")
             return
@@ -1289,7 +1289,7 @@ async def fetch_file_content_via_mcp_or_api(ctx: Context, owner: str, repo: str,
                 args["ref"] = ref
             elif "branch" in param_names:
                 args["branch"] = ref
-            
+
             result = await get_file_tool.run_async(args=args, tool_context=ctx)
             content_str = ""
             sha = ""
@@ -1367,7 +1367,7 @@ async def commit_file_change_via_mcp_or_api(
                 args["branch"] = branch_name
             elif "ref" in param_names:
                 args["ref"] = branch_name
-            
+
             await update_file_tool.run_async(args=args, tool_context=ctx)
             logger.info(f"Committed '{path}' to branch '{branch_name}' via MCP.")
             return
@@ -1381,9 +1381,9 @@ async def commit_file_change_via_mcp_or_api(
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28"
     }
-    
+
     encoded_content = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-    
+
     data = {
         "message": commit_msg,
         "content": encoded_content,

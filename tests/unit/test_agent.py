@@ -625,7 +625,7 @@ def test_apply_patch():
 @pytest.mark.asyncio
 async def test_open_pr_sequence(monkeypatch):
     import json
-    
+
     # We will mock github_mcp to return our tools
     class MockToolDeclaration:
         def __init__(self, params):
@@ -642,10 +642,10 @@ async def test_open_pr_sequence(monkeypatch):
     class MockGetRepoTool:
         def __init__(self):
             self.name = "get_repository"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo"])
-            
+
         async def run_async(self, args, tool_context):
             return {
                 "content": [
@@ -659,10 +659,10 @@ async def test_open_pr_sequence(monkeypatch):
     class MockGetBranchTool:
         def __init__(self):
             self.name = "get_branch"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo", "branch"])
-            
+
         async def run_async(self, args, tool_context):
             return {
                 "content": [
@@ -676,20 +676,20 @@ async def test_open_pr_sequence(monkeypatch):
     class MockCreateBranchTool:
         def __init__(self):
             self.name = "create_ref"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo", "ref", "sha"])
-            
+
         async def run_async(self, args, tool_context):
             return {"content": [{"type": "text", "text": "Branch created"}]}
 
     class MockGetFileTool:
         def __init__(self):
             self.name = "get_file"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo", "path", "ref"])
-            
+
         async def run_async(self, args, tool_context):
             return {
                 "content": [
@@ -703,20 +703,20 @@ async def test_open_pr_sequence(monkeypatch):
     class MockUpdateFileTool:
         def __init__(self):
             self.name = "update_file"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo", "path", "content", "message", "sha", "branch"])
-            
+
         async def run_async(self, args, tool_context):
             return {"content": [{"type": "text", "text": "File updated"}]}
 
     class MockCreatePRTool:
         def __init__(self):
             self.name = "create_pull_request"
-            
+
         def _get_declaration(self):
             return MockToolDeclaration(["owner", "repo", "title", "body", "head", "base"])
-            
+
         async def run_async(self, args, tool_context):
             return {"content": [{"type": "text", "text": "PR-Created-Success"}]}
 
@@ -729,7 +729,7 @@ async def test_open_pr_sequence(monkeypatch):
             MockUpdateFileTool(),
             MockCreatePRTool()
         ]
-        
+
     monkeypatch.setattr(github_mcp, "get_tools", mock_get_tools)
 
     class MockContext:
@@ -747,6 +747,3 @@ async def test_open_pr_sequence(monkeypatch):
     event = await open_pr(ctx, None)
     assert event.actions.state_delta["pull_request_created"] is True
     assert "PR-Created-Success" in event.output
-
-
-

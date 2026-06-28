@@ -1,0 +1,11 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+#  - repo: https://github.com/semgrep/semgrep
+#    rev: v1.80.0
+#    hooks:
+#      - id: semgrep
+#        args: ['--config', '.semgrep/rules.yaml', '--error']
