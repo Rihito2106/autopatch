@@ -747,3 +747,33 @@ async def test_open_pr_sequence(monkeypatch):
     event = await open_pr(ctx, None)
     assert event.actions.state_delta["pull_request_created"] is True
     assert "PR-Created-Success" in event.output
+
+
+def test_normalize_webhook_payload():
+    from autopatch.fast_api_app import normalize_webhook_payload
+    import base64
+    import json
+
+    # 1. Plain dictionary payload
+    payload = {"issue": {"title": "Hello"}}
+    assert normalize_webhook_payload(payload) == payload
+
+    # 2. Base64-encoded string payload inside 'data' key
+    inner_payload = {"issue": {"title": "Base64 Title", "body": "Body Text"}}
+    encoded_payload = base64.b64encode(json.dumps(inner_payload).encode("utf-8")).decode("utf-8")
+    payload_with_data = {"data": encoded_payload}
+
+    normalized = normalize_webhook_payload(payload_with_data)
+    assert isinstance(normalized, dict)
+    assert normalized["issue"]["title"] == "Base64 Title"
+    assert normalized["issue"]["body"] == "Body Text"
+
+    # 3. Plain JSON string inside 'data' key
+    json_payload = json.dumps(inner_payload)
+    payload_with_json = {"data": json_payload}
+    normalized_json = normalize_webhook_payload(payload_with_json)
+    assert normalized_json == inner_payload
+
+    # 4. Plain string inside 'data' key (non-JSON, non-base64)
+    payload_with_plain_string = {"data": "just a string"}
+    assert normalize_webhook_payload(payload_with_plain_string) == "just a string"

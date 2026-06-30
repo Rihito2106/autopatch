@@ -74,13 +74,30 @@ class WebhookInput(BaseModel):
     @classmethod
     def parse_input(cls, data: Any) -> Any:
         """Pre-processes input data to handle standard chat messages (types.Content) from test runners."""
+        if isinstance(data, str) and not data.strip():
+            raise ValueError("Input string cannot be empty")
         if isinstance(data, dict) and "payload" in data:
             return data
 
         # If the input is a types.Content chat message (having 'parts')
         if hasattr(data, "parts") or (isinstance(data, dict) and "parts" in data):
-            text_content = ""
             parts = data.parts if hasattr(data, "parts") else data["parts"]
+            # Check for a structured webhook_event payload inside function_response
+            for part in parts:
+                fr = getattr(part, "function_response", None) or (
+                    part.get("function_response") if isinstance(part, dict) else None
+                )
+                if fr:
+                    fr_name = getattr(fr, "name", None) or (
+                        fr.get("name") if isinstance(fr, dict) else None
+                    )
+                    fr_response = getattr(fr, "response", None) or (
+                        fr.get("response") if isinstance(fr, dict) else None
+                    )
+                    if fr_name == "webhook_event" and fr_response:
+                        return {"payload": fr_response}
+
+            text_content = ""
             for part in parts:
                 if hasattr(part, "text") and part.text:
                     text_content += part.text
@@ -895,6 +912,49 @@ async def security_audit(ctx: Context, node_input: Any) -> Event:
     import re
     logger = logging.getLogger("autopatch.security_audit")
 
+    def run_fallback_scan(diff: str) -> dict[str, Any]:
+        patterns = {
+            "python.hardcoded-google-api-key": (
+                re.compile(r"AIzaSy[A-Za-z0-9_\-]{35}"),
+                "Hardcoded Google API key detected"
+            ),
+            "python.hardcoded-github-token": (
+                re.compile(r"ghp_[A-Za-z0-9]{36}"),
+                "Hardcoded GitHub token detected"
+            ),
+            "python.hardcoded-openai-key": (
+                re.compile(r"sk-[A-Za-z0-9]{48}"),
+                "Hardcoded OpenAI key detected"
+            ),
+            "python.generic-secret": (
+                re.compile(r"(secret|password|api_key)\s*=\s*['\"][^'\"]{8,}['\"]", re.IGNORECASE),
+                "Generic secret assignment detected"
+            )
+        }
+
+        scan_findings = []
+        for line in diff.splitlines():
+            for rule_id, (pattern, message) in patterns.items():
+                if pattern.search(line):
+                    scan_findings.append({
+                        "severity": "CRITICAL",
+                        "rule_id": rule_id,
+                        "message": message,
+                        "line": line
+                    })
+
+        if scan_findings:
+            return {
+                "findings": scan_findings,
+                "audit_passed": False,
+                "method": "python-fallback"
+            }
+        return {
+            "findings": [],
+            "audit_passed": True,
+            "method": "python-fallback"
+        }
+
     diff_str = ctx.state.get("proposed_diff", "")
     if not diff_str:
         logger.warning("No proposed diff found in state to audit.")
@@ -1007,19 +1067,45 @@ async def security_audit(ctx: Context, node_input: Any) -> Event:
                 actions={"state_delta": state_delta}
             )
 
-    except Exception as e:
-        logger.error(f"Error during security audit: {e}", exc_info=True)
-        # Fallback check
-        api_key_regex = re.compile(r"AIzaSy[A-Za-z0-9_-]*")
-        matches = api_key_regex.findall(diff_str)
-        if matches:
+    except (ConnectionError, TimeoutError) as e:
+        logger.warning(f"Semgrep MCP unavailable (Windows/local): {e}. Using Python regex fallback for security scan.")
+        fallback_res = run_fallback_scan(diff_str)
+        findings = fallback_res["findings"]
+
+        if not fallback_res["audit_passed"]:
             state_delta = {
                 "security_event": True,
-                "security_findings": [f"Fallback regex matched API key prefix: {matches}"],
+                "security_findings": findings,
                 "security_status": "critical"
             }
             return Event(
-                output=f"🚨 SECURITY AUDIT FAILED (CRITICAL - Fallback Check):\nFound hardcoded Google API key prefixes: {matches}",
+                output=f"🚨 SECURITY AUDIT FAILED (CRITICAL - Fallback Check):\nFound hardcoded keys/secrets: {findings}",
+                actions={"state_delta": state_delta}
+            )
+        else:
+            state_delta = {
+                "security_findings": [],
+                "security_status": "clean"
+            }
+            return Event(
+                output="✅ Security audit clean. No issues found (Python fallback).",
+                actions={"state_delta": state_delta}
+            )
+
+    except Exception as e:
+        logger.error(f"Error during security audit: {e}", exc_info=True)
+        logger.warning("Semgrep MCP unavailable (Windows/local). Using Python regex fallback for security scan.")
+        fallback_res = run_fallback_scan(diff_str)
+        findings = fallback_res["findings"]
+
+        if not fallback_res["audit_passed"]:
+            state_delta = {
+                "security_event": True,
+                "security_findings": findings,
+                "security_status": "critical"
+            }
+            return Event(
+                output=f"🚨 SECURITY AUDIT FAILED (CRITICAL - Fallback Check):\nFound hardcoded keys/secrets: {findings}",
                 actions={"state_delta": state_delta}
             )
         else:

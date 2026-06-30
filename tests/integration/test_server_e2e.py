@@ -206,3 +206,48 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
         FEEDBACK_URL, json=feedback_data, headers=HEADERS, timeout=10
     )
     assert response.status_code == 200
+
+
+def test_health(server_fixture: subprocess.Popen[str]) -> None:
+    """Test the health endpoint."""
+    response = requests.get(BASE_URL + "/health", timeout=10)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+
+
+def test_webhook(server_fixture: subprocess.Popen[str]) -> None:
+    """Test the webhook endpoint accepts plain JSON payloads."""
+    payload = {
+        "issue": {
+            "title": "Bug report",
+            "body": "It doesn't work.",
+            "number": 123
+        },
+        "repository": {
+            "full_name": "owner/repo"
+        }
+    }
+    response = requests.post(BASE_URL + "/webhook", json=payload, headers=HEADERS, timeout=10)
+    assert response.status_code == 200
+    assert response.json() == {"status": "accepted"}
+
+
+def test_webhook_base64(server_fixture: subprocess.Popen[str]) -> None:
+    """Test the webhook endpoint accepts base64-encoded payloads inside a 'data' key."""
+    import base64
+    inner = {
+        "issue": {
+            "title": "Encoded Bug report",
+            "body": "Base64 payload test.",
+            "number": 456
+        },
+        "repository": {
+            "full_name": "owner/repo"
+        }
+    }
+    encoded = base64.b64encode(json.dumps(inner).encode("utf-8")).decode("utf-8")
+    payload = {"data": encoded}
+
+    response = requests.post(BASE_URL + "/webhook", json=payload, headers=HEADERS, timeout=10)
+    assert response.status_code == 200
+    assert response.json() == {"status": "accepted"}
