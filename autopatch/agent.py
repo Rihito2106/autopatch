@@ -58,6 +58,21 @@ CONFIG = {
         "disregard previous instructions",
         "override system prompt",
     ],
+    # Patterns that indicate a critical security vulnerability disclosure.
+    # These are detected BEFORE any LLM runs so the raw body is never passed
+    # to classify_issue. The report goes straight to human_approval.
+    "CRITICAL_SECURITY_PATTERNS": [
+        "cve-",          # CVE identifier (e.g. CVE-2024-12345)
+        "exploit",       # explicit exploit mention
+        "remote code execution",
+        "arbitrary code execution",
+        "zero-day",
+        "0-day",
+        "rce vulnerability",
+        "sql injection vulnerability",
+        "buffer overflow",
+        "privilege escalation",
+    ],
 }
 
 # --- Pydantic Schemas for Node Inputs and Outputs ---
@@ -275,6 +290,7 @@ def fetch_github_file(owner: str, repo: str, path: str, token: str) -> str:
 # --- Workflow Nodes (Decoupled from Node wrapper for direct testing) ---
 
 
+@node
 def parse_issue(node_input: WebhookInput) -> ParsedIssue:
     """Extracts issue details from a raw base64 or plain JSON/dict webhook payload."""
     raw_payload = node_input.payload
@@ -347,19 +363,40 @@ def parse_issue(node_input: WebhookInput) -> ParsedIssue:
     )
 
 
+@node
 def security_screen(ctx: Context, node_input: ParsedIssue) -> Event:
-    """Pre-LLM gate detecting prompt injections, scrubbing secrets, and redacting emails.
+    """Pre-LLM gate detecting prompt injections, critical exploits, scrubbing secrets.
 
-    If prompt injection is detected, flags security_event=True and routes directly to human approval.
-    Ensures that the LLM never receives the raw body (only the sanitized body or redaction notice).
+    Two classes of issues are intercepted BEFORE any LLM node runs:
+    1. Prompt injections – flagged and redacted.
+    2. Critical security vulnerability disclosures (CVE, exploit, RCE …) –
+       routed directly to human_approval so the raw exploit body is never
+       processed by classify_issue or any other LLM node.
+
+    All other issues are sanitized (secrets scrubbed, emails redacted) and
+    passed downstream to classify_issue.
     """
+    text_lower = (node_input.title + " " + node_input.body).lower()
+
     injection_detected = detect_injection(node_input.title) or detect_injection(
         node_input.body
+    )
+
+    critical_exploit_detected = any(
+        pattern in text_lower
+        for pattern in CONFIG["CRITICAL_SECURITY_PATTERNS"]
     )
 
     if injection_detected:
         sanitized_body = "[REDACTED - PROMPT INJECTION DETECTED]"
         title = "[REDACTED - PROMPT INJECTION DETECTED]"
+        security_event = True
+    elif critical_exploit_detected:
+        # Sanitize secrets but keep the body readable for the human reviewer.
+        sanitized_body = scrub_secrets(node_input.body)
+        sanitized_body = redact_emails(sanitized_body)
+        title = scrub_secrets(node_input.title)
+        title = redact_emails(title)
         security_event = True
     else:
         sanitized_body = scrub_secrets(node_input.body)
@@ -398,12 +435,13 @@ Determine:
 1. The classification category: "bug", "feature", "docs", "security", or "spam".
 2. The severity level: "critical", "normal", or "low".
 
-Output the result conforming exactly to the requested schema.
-""",
+Output the result strictly as a JSON object matching the provided schema. Do not include markdown code blocks or additional text.""",
+    generate_content_config={"response_mime_type": "application/json"},
     output_schema=ClassificationOutput,
 )
 
 
+@node
 def route_issue(node_input: ClassificationOutput) -> Event:
     """Deterministic routing node based on classification and severity."""
     category = node_input.classification
@@ -502,6 +540,7 @@ semgrep_mcp = McpToolset(
 # --- Bug Pipeline Nodes ---
 
 
+@node
 def reproduce_bug(ctx: Context, node_input: Any) -> Event:
     """Clones the repository at HEAD, builds it, isolates network, and runs pytest inside Docker."""
     import logging
@@ -716,6 +755,7 @@ def reproduce_bug(ctx: Context, node_input: Any) -> Event:
         return Event(output=result, actions={"state_delta": state_delta})
 
 
+@node
 def prepare_root_cause_input(ctx: Context, node_input: ReproductionResult) -> str:
     """Formats the prompt for the analyze_root_cause LlmAgent."""
     repo_full_name = ctx.state.get("repo_full_name", "")
@@ -765,13 +805,17 @@ analyze_root_cause = LlmAgent(
 Analyze the provided issue, reproduction result, and traceback.
 Use the 'get_file_contents' tool to fetch files mentioned in the traceback.
 Identify the root cause of the bug and determine which files need to be modified to fix the issue.
+
+IMPORTANT: You MUST always respond with a valid JSON object. Never produce an empty response.
 Conform exactly to the requested output schema.
 """,
     tools=[github_mcp],
     output_schema=RootCauseOutput,
+    generate_content_config={"response_mime_type": "application/json"},
 )
 
 
+@node
 def fetch_files_for_fix(ctx: Context, node_input: RootCauseOutput) -> Event:
     """Helper node that downloads the files to modify using GitHub REST API."""
     repo_full_name = ctx.state.get("repo_full_name", "")
@@ -810,12 +854,16 @@ propose_fix = LlmAgent(
 Propose a code fix for the bug based on the explanation and file contents.
 Output a unified diff of the changes. The diff must ONLY modify the files specified in the allowed files list.
 Do not modify any other files.
+
+IMPORTANT: You MUST always respond with a valid JSON object. Never produce an empty response.
 Conform exactly to the requested output schema.
 """,
     output_schema=FixProposal,
+    generate_content_config={"response_mime_type": "application/json"},
 )
 
 
+@node
 def validate_diff(ctx: Context, node_input: FixProposal) -> Event:
     """Validates that the diff only modifies files in files_to_modify."""
     diff_str = node_input.diff
@@ -861,6 +909,7 @@ def _handle_retry_or_fail(ctx: Context, error_msg: str) -> Event:
 # --- Non-Bug Pipeline Nodes ---
 
 
+@node
 def prepare_non_bug_input(ctx: Context, node_input: ClassificationOutput) -> str:
     """Formats the prompt for the handle_non_bug LlmAgent."""
     repo_full_name = ctx.state.get("repo_full_name", "")
@@ -905,6 +954,7 @@ Conform exactly to the requested output schema.
 )
 
 
+@node
 async def security_audit(ctx: Context, node_input: Any) -> Event:
     """Runs a Semgrep security audit on the proposed diff before human approval."""
     import json
@@ -1483,6 +1533,7 @@ async def commit_file_change_via_mcp_or_api(
         raise RuntimeError(f"Failed to commit '{path}' via REST API: {resp.status_code} - {resp.text}")
 
 
+@node
 async def open_pr(ctx: Context, node_input: Any) -> Event:
     """Creates a branch, commits the patch files, and opens a pull request using GitHub MCP tools or REST API fallback."""
     import logging
@@ -1595,6 +1646,7 @@ async def open_pr(ctx: Context, node_input: Any) -> Event:
     return Event(output=output_msg, actions={"state_delta": {"pull_request_created": True}})
 
 
+@node
 async def close_with_comment(ctx: Context, node_input: Any) -> Event:
     """Closes the issue with a comment explaining the rejection."""
     import logging
@@ -1735,7 +1787,6 @@ root_agent = Workflow(
         ),
         # Non-Bug Pipeline branch
         (prepare_non_bug_input, handle_non_bug),
-        (handle_non_bug, human_approval),
     ],
 )
 
