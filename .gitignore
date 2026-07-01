@@ -220,3 +220,10 @@ __marimo__/
 .env
 
 **/.adk/
+
+*.tfvars
+
+
+artifacts/grade_results/results_*
+!artifacts/grade_results/results_latest.html
+!artifacts/grade_results/results_latest.json

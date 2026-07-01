@@ -97,7 +97,7 @@ def test_parse_issue_json():
         "repository": {"full_name": "owner/repo"},
     }
     input_data = WebhookInput(payload=payload)
-    parsed = parse_issue(input_data)
+    parsed = parse_issue._func(input_data)
     assert parsed.title == "Bug in main.py"
     assert "main.py" in parsed.linked_files
     assert parsed.author == "octocat"
@@ -118,7 +118,7 @@ def test_parse_issue_base64():
     }
     encoded = base64.b64encode(json.dumps(payload_dict).encode("utf-8")).decode("utf-8")
     input_data = WebhookInput(payload=encoded)
-    parsed = parse_issue(input_data)
+    parsed = parse_issue._func(input_data)
     assert parsed.title == "Base64 Bug"
     assert parsed.author == "dev"
 
@@ -134,7 +134,7 @@ def test_parse_issue_flat():
         "labels": ["flat-bug"],
     }
     input_data = WebhookInput(payload=payload)
-    parsed = parse_issue(input_data)
+    parsed = parse_issue._func(input_data)
     assert parsed.title == "Flat Bug"
     assert parsed.body == "This is a flat body"
     assert parsed.author == "flat-dev"
@@ -162,7 +162,7 @@ def test_security_screen_no_injection(monkeypatch):
             self.actions = MockActions()
 
     ctx = MockContext()
-    event = security_screen(ctx, parsed)
+    event = security_screen._func(ctx, parsed)
 
     assert event.actions.route == "__DEFAULT__"
     assert event.output is not None and "[REDACTED_EMAIL]" in str(event.output)
@@ -190,7 +190,7 @@ def test_security_screen_with_injection(monkeypatch):
             self.actions = MockActions()
 
     ctx = MockContext()
-    event = security_screen(ctx, parsed)
+    event = security_screen._func(ctx, parsed)
 
     assert event.actions.route == "security_event"
     assert event.output == "[REDACTED - PROMPT INJECTION DETECTED]"
@@ -208,17 +208,17 @@ def test_security_screen_with_injection(monkeypatch):
 def test_route_issue():
     # Category bug -> bug_pipeline
     classification = ClassificationOutput(classification="bug", severity="critical")
-    event = route_issue(classification)
+    event = route_issue._func(classification)
     assert event.actions.route == "bug_pipeline"
 
     # Category security -> hitl_direct
     classification = ClassificationOutput(classification="security", severity="low")
-    event = route_issue(classification)
+    event = route_issue._func(classification)
     assert event.actions.route == "hitl_direct"
 
     # Category docs -> non_bug
     classification = ClassificationOutput(classification="docs", severity="normal")
-    event = route_issue(classification)
+    event = route_issue._func(classification)
     assert event.actions.route == "non_bug"
 
 
@@ -255,7 +255,7 @@ def test_prepare_root_cause_input():
         traceback="Some traceback",
         reproduction_command="pytest",
     )
-    prompt = prepare_root_cause_input(ctx, repro)
+    prompt = prepare_root_cause_input._func(ctx, repro)
     assert "owner/repo" in prompt
     assert "Owner: 'owner'" in prompt
     assert "Repo: 'repo'" in prompt
@@ -328,7 +328,7 @@ def test_reproduce_bug(monkeypatch):
             self.state = {"repo_full_name": "owner/repo"}
 
     ctx = MockContext()
-    event = reproduce_bug(ctx, None)
+    event = reproduce_bug._func(ctx, None)
 
     assert event.output.reproduced is True
     assert "test_agent.py::test_run" in event.output.failing_tests
@@ -360,7 +360,7 @@ def test_fetch_files_for_fix(monkeypatch):
         files_to_modify=["autopatch/agent.py", "nonexistent.py"],
     )
 
-    event = fetch_files_for_fix(ctx, node_input)
+    event = fetch_files_for_fix._func(ctx, node_input)
     assert "autopatch/agent.py" in event.actions.state_delta["file_contents"]
     assert (
         "print('hello')"
@@ -386,7 +386,7 @@ def test_validate_diff():
         explanation="Good fix",
         diff="--- a/autopatch/agent.py\n+++ b/autopatch/agent.py\n+new_code",
     )
-    event = validate_diff(ctx, fix)
+    event = validate_diff._func(ctx, fix)
     assert event.actions.route == "success"
     assert event.actions.state_delta["validation_status"] == "success"
 
@@ -396,13 +396,13 @@ def test_validate_diff():
         explanation="Bad fix modifying wrong file",
         diff="--- a/tests/test_agent.py\n+++ b/tests/test_agent.py\n+new_code",
     )
-    event = validate_diff(ctx, fix_bad)
+    event = validate_diff._func(ctx, fix_bad)
     assert event.actions.route == "retry"
     assert event.actions.state_delta["validation_retries"] == 2
 
     # 3. Fail case (retries reaches 3)
     ctx = MockContext(retries=3)
-    event = validate_diff(ctx, fix_bad)
+    event = validate_diff._func(ctx, fix_bad)
     assert event.actions.route == "fail"
     assert event.actions.state_delta["validation_status"] == "fail"
     assert event.output is not None
@@ -467,7 +467,7 @@ def test_reproduce_bug_install_failure(monkeypatch):
             self.state = {"repo_full_name": "owner/repo"}
 
     ctx = MockContext()
-    event = reproduce_bug(ctx, None)
+    event = reproduce_bug._func(ctx, None)
 
     assert event.output.reproduced is False
     assert "Dependency installation failed with code 1" in event.output.traceback
@@ -514,7 +514,7 @@ async def test_security_audit_clean(monkeypatch):
             self.state = {"proposed_diff": diff}
 
     ctx = MockContext("--- a/file.py\n+++ b/file.py\n+print('hello')")
-    event = await security_audit(ctx, None)
+    event = await security_audit._func(ctx, None)
     assert event.actions.state_delta["security_status"] == "clean"
     assert event.actions.state_delta.get("security_event") is not True
 
@@ -558,7 +558,7 @@ async def test_security_audit_critical(monkeypatch):
             self.state = {"proposed_diff": diff}
 
     ctx = MockContext("--- a/file.py\n+++ b/file.py\n+api_key = 'AIzaSyFakeKey'")
-    event = await security_audit(ctx, None)
+    event = await security_audit._func(ctx, None)
     assert event.actions.state_delta["security_status"] == "critical"
     assert event.actions.state_delta["security_event"] is True
 
@@ -576,13 +576,13 @@ async def test_security_audit_fallback(monkeypatch):
 
     # Case 1: Fallback matches API Key
     ctx = MockContext("--- a/file.py\n+++ b/file.py\n+api_key = 'AIzaSyFakeKey'")
-    event = await security_audit(ctx, None)
+    event = await security_audit._func(ctx, None)
     assert event.actions.state_delta["security_status"] == "critical"
     assert event.actions.state_delta["security_event"] is True
 
     # Case 2: Fallback clean
     ctx2 = MockContext("--- a/file.py\n+++ b/file.py\n+print('hello')")
-    event2 = await security_audit(ctx2, None)
+    event2 = await security_audit._func(ctx2, None)
     assert event2.actions.state_delta["security_status"] == "error"
     assert event2.actions.state_delta.get("security_event") is not True
 
@@ -744,7 +744,7 @@ async def test_open_pr_sequence(monkeypatch):
             }
 
     ctx = MockContext()
-    event = await open_pr(ctx, None)
+    event = await open_pr._func(ctx, None)
     assert event.actions.state_delta["pull_request_created"] is True
     assert "PR-Created-Success" in event.output
 
