@@ -1,0 +1,10 @@
+{
+    "issue_number": 3,
+    "repo_full_name": "Rihito2106/autopatch-test-target",
+    "title": "IndexError in get_initials for single-word names",
+    "body": "get_initials() crashes with IndexError when passed a name with no space (e.g. 'Madonna').\n\nTraceback:\n File 'stringutils.py', line 3, in get_initials\n  return parts[0][0] + parts[1][0]\nIndexError: list index out of range",
+    "labels": [
+        "bug"
+    ],
+    "author": "testuser"
+}

@@ -623,6 +623,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <script>
         let expandedSessionId = null;
         let pendingSessions = [];
+        const activeActions = new Set();
+        const completedActions = {};
 
         function escapeHtml(unsafe) {
             return unsafe
@@ -655,7 +657,17 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 document.getElementById('stat-approved').innerText = data.stats.auto_approved_today;
                 document.getElementById('stat-flagged').innerText = data.stats.security_flags;
 
-                pendingSessions = data.sessions;
+                // Keep active or completed sessions visible in the DOM
+                const currentInvocations = new Set(data.sessions.map(s => s.invocation_id));
+                const extraSessions = pendingSessions.filter(s => activeActions.has(s.invocation_id) || completedActions[s.invocation_id]);
+                const merged = [...data.sessions];
+                for (const s of extraSessions) {
+                    if (!currentInvocations.has(s.invocation_id)) {
+                        merged.push(s);
+                    }
+                }
+
+                pendingSessions = merged;
                 renderTimeline();
             } catch (err) {
                 console.error("Error fetching pending:", err);
@@ -691,6 +703,8 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
             document.getElementById(spinnerId).style.display = 'inline-block';
             document.getElementById(labelId).style.display = 'none';
 
+            activeActions.add(invocationId);
+
             try {
                 const response = await fetch(`/api/action/${sessionId}`, {
                     method: 'POST',
@@ -705,21 +719,30 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                 });
 
                 const result = await response.json();
+                completedActions[invocationId] = result.response;
 
                 // Render agent final response inline
                 const responsePanel = document.getElementById(`agent-response-${invocationId}`);
-                responsePanel.innerHTML = `
-                    <div class="agent-response-box">
-                        <div class="details-section-title">Agent Final Output</div>
-                        <div class="response-content">${escapeHtml(result.response)}</div>
-                    </div>
-                `;
+                if (responsePanel) {
+                    responsePanel.innerHTML = `
+                        <div class="agent-response-box">
+                            <div class="details-section-title">Agent Final Output</div>
+                            <div class="response-content">${escapeHtml(result.response)}</div>
+                        </div>
+                    `;
+                }
+                const actionBar = document.getElementById(`action-bar-${invocationId}`);
+                if (actionBar) {
+                    actionBar.style.display = 'none';
+                }
             } catch (err) {
                 alert(`Error executing action: ${err}`);
                 btnApprove.disabled = false;
                 btnReject.disabled = false;
                 document.getElementById(spinnerId).style.display = 'none';
                 document.getElementById(labelId).style.display = 'inline';
+            } finally {
+                activeActions.delete(invocationId);
             }
         }
 
@@ -788,8 +811,15 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
                                     <div class="diff-code">${highlightDiff(session.diff)}</div>
                                 </div>
                             </div>
-                            <div id="agent-response-${session.invocation_id}"></div>
-                            <div class="action-bar" id="action-bar-${session.invocation_id}">
+                            <div id="agent-response-${session.invocation_id}">
+                                ${completedActions[session.invocation_id] ? `
+                                    <div class="agent-response-box">
+                                        <div class="details-section-title">Agent Final Output</div>
+                                        <div class="response-content">${escapeHtml(completedActions[session.invocation_id])}</div>
+                                    </div>
+                                ` : ''}
+                            </div>
+                            <div class="action-bar" id="action-bar-${session.invocation_id}" style="${completedActions[session.invocation_id] ? 'display: none;' : ''}">
                                 <button class="btn btn-reject" id="btn-reject-${session.invocation_id}" onclick="takeAction('${session.session_id}', '${session.interrupt_id}', false, '${session.invocation_id}')">
                                     <span class="spinner spinner-orange" id="spinner-reject-${session.invocation_id}" style="display: none;"></span>
                                     <span id="label-reject-${session.invocation_id}">Reject Patch</span>
