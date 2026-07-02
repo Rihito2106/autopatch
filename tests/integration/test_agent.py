@@ -28,7 +28,7 @@ def test_agent_stream() -> None:
 
     session_service = InMemorySessionService()
 
-    session = session_service.create_session_sync(user_id="test_user", app_name="test")
+    session = session_service.create_session_sync(user_id="default-user", app_name="test")
     runner = Runner(agent=root_agent, session_service=session_service, app_name="test")
 
     message = types.Content(
@@ -38,7 +38,7 @@ def test_agent_stream() -> None:
     events = list(
         runner.run(
             new_message=message,
-            user_id="test_user",
+            user_id="default-user",
             session_id=session.id,
             run_config=RunConfig(streaming_mode=StreamingMode.SSE),
         )

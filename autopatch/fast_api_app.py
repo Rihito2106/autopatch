@@ -120,7 +120,7 @@ async def run_workflow_task(payload: Any):
         else:
             session_id = f"session-{uuid.uuid4()}"
 
-        user_id = "github-webhook"
+        user_id = "default-user"
 
         # Prepare the message content for ADK workflow with structured dictionary payload
         message = types.Content(

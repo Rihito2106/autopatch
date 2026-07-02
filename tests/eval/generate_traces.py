@@ -188,7 +188,7 @@ async def _run_scenario_once(case_id, payload, runner, session_service, attempt=
     if not spec:
         raise ValueError(f"No spec defined for case_id={case_id!r}")
 
-    user_id = "eval-user"
+    user_id = "default-user"
     session_id = f"eval-session-{case_id}-attempt{attempt}"
 
     # Pre-run branch deletion for TC01 to prevent 409 commit conflict

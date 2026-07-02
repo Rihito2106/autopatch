@@ -41,7 +41,7 @@ async def test_agent_stream_query(agent_app: AgentEngineApp) -> None:
     # Create message and events for the async_stream_query
     message = "Hi!"
     events = []
-    async for event in agent_app.async_stream_query(message=message, user_id="test"):
+    async for event in agent_app.async_stream_query(message=message, user_id="default-user"):
         events.append(event)
     assert len(events) > 0, "Expected at least one chunk in response"
 
@@ -69,7 +69,7 @@ def test_agent_feedback(agent_app: AgentEngineApp) -> None:
     feedback_data = {
         "score": 5,
         "text": "Great response!",
-        "user_id": "test-user-456",
+        "user_id": "default-user",
         "session_id": "test-session-456",
     }
 
@@ -81,7 +81,7 @@ def test_agent_feedback(agent_app: AgentEngineApp) -> None:
         invalid_feedback = {
             "score": "invalid",  # Score must be numeric
             "text": "Bad feedback",
-            "user_id": "test-user-789",
+            "user_id": "default-user",
             "session_id": "test-session-789",
         }
         agent_app.register_feedback(invalid_feedback)

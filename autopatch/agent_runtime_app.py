@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 import os
-from typing import Any
+from typing import Any, Optional, List, Union, Generator, AsyncIterable
 
 import vertexai
 from dotenv import load_dotenv
@@ -55,6 +55,106 @@ class AgentEngineApp(AdkApp):
     def clone(self) -> "AgentEngineApp":
         """Returns a clone of the Agent Runtime application."""
         return self
+
+    async def async_stream_query(
+        self,
+        *,
+        message: Union[str, dict[str, Any]],
+        user_id: str = "default-user",
+        session_id: Optional[str] = None,
+        session_events: Optional[List[dict[str, Any]]] = None,
+        run_config: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> AsyncIterable[dict[str, Any]]:
+        """Streams responses asynchronously, forcing user_id='default-user'."""
+        user_id = "default-user"
+        async for event in super().async_stream_query(
+            message=message,
+            user_id=user_id,
+            session_id=session_id,
+            session_events=session_events,
+            run_config=run_config,
+            **kwargs,
+        ):
+            yield event
+
+    def stream_query(
+        self,
+        *,
+        message: Union[str, dict[str, Any]],
+        user_id: str = "default-user",
+        session_id: Optional[str] = None,
+        run_config: Optional[dict[str, Any]] = None,
+        **kwargs,
+    ) -> Generator[dict[str, Any], None, None]:
+        """Streams responses synchronously, forcing user_id='default-user'."""
+        user_id = "default-user"
+        for event in super().stream_query(
+            message=message,
+            user_id=user_id,
+            session_id=session_id,
+            run_config=run_config,
+            **kwargs,
+        ):
+            yield event
+
+    async def async_create_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        **kwargs,
+    ) -> dict[str, Any]:
+        user_id = "default-user"
+        return await super().async_create_session(user_id=user_id, **kwargs)
+
+    def create_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        **kwargs,
+    ) -> dict[str, Any]:
+        user_id = "default-user"
+        return super().create_session(user_id=user_id, **kwargs)
+
+    async def async_get_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        session_id: str,
+        **kwargs,
+    ) -> dict[str, Any]:
+        user_id = "default-user"
+        return await super().async_get_session(user_id=user_id, session_id=session_id, **kwargs)
+
+    def get_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        session_id: str,
+        **kwargs,
+    ) -> dict[str, Any]:
+        user_id = "default-user"
+        return super().get_session(user_id=user_id, session_id=session_id, **kwargs)
+
+    async def async_delete_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        session_id: str,
+        **kwargs,
+    ):
+        user_id = "default-user"
+        await super().async_delete_session(user_id=user_id, session_id=session_id, **kwargs)
+
+    def delete_session(
+        self,
+        *,
+        user_id: str = "default-user",
+        session_id: str,
+        **kwargs,
+    ):
+        user_id = "default-user"
+        super().delete_session(user_id=user_id, session_id=session_id, **kwargs)
 
 
 gemini_location = os.environ.get("GOOGLE_CLOUD_LOCATION")

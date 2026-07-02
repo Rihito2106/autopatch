@@ -116,7 +116,7 @@ def test_chat_stream(server_fixture: subprocess.Popen[str]) -> None:
     """Test the chat stream functionality."""
     logger.info("Starting chat stream test")
     # Create session first
-    user_id = "test_user_123"
+    user_id = "default-user"
     session_data = {"state": {"preferred_language": "English", "visit_count": 1}}
 
     session_url = f"{BASE_URL}/apps/autopatch/users/{user_id}/sessions"
@@ -197,7 +197,7 @@ def test_collect_feedback(server_fixture: subprocess.Popen[str]) -> None:
     # Create sample feedback data
     feedback_data = {
         "score": 4,
-        "user_id": "test-user-456",
+        "user_id": "default-user",
         "session_id": "test-session-456",
         "text": "Great response!",
     }
